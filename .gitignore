@@ -109,7 +109,7 @@ common/temp/
 common/autoinstallers/*/.npmrc
 common/autoinstallers/*/node_modules/
 **/.rush/temp/
-.claude/settings.local.json
+.claude/
 
 # Common toolchain intermediate files
 temp/
