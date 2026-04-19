@@ -345,6 +345,14 @@
       ]
     },
     {
+      "packageName": "monitor-board",
+      "projectFolder": "apps/monitor-board",
+      "tags": [
+        "app",
+        "tools"
+      ]
+    },
+    {
       "packageName": "@luobata/tmux-manager",
       "projectFolder": "packages/tmux-manager",
       "tags": [
