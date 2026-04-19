@@ -10,6 +10,7 @@ import { buildPlan } from '../src/planner/planner.js'
 import { loadRoleModelConfig } from '../src/role-model-config/loader.js'
 import { applyFailurePolicies, loadFailurePolicyConfig } from '../src/runtime/failure-policy.js'
 import { buildExecutionBatches } from '../src/runtime/scheduler.js'
+import { loadRunReport } from '../src/runtime/state-store.js'
 import { buildRoleRegistry, loadRoles } from '../src/team/role-registry.js'
 import { loadTeamCompositionRegistry } from '../src/team/team-composition-loader.js'
 import { verifyAssignments } from '../src/verification/index.js'
@@ -37,7 +38,18 @@ describe('planner and dispatcher', () => {
     expect(plan.tasks.some((task) => task.taskType === 'coding')).toBe(true)
     expect(plan.tasks.some((task) => task.taskType === 'testing')).toBe(true)
     expect(assignments.find((item) => item.task.taskType === 'coding')?.modelResolution.model).toBe('gpt5.3-codex')
+    expect(assignments.find((item) => item.task.taskType === 'coding')?.executionTarget).toMatchObject({
+      backend: 'coco',
+      model: 'gpt5.3-codex',
+      transport: 'auto',
+      source: 'taskType'
+    })
     expect(assignments.find((item) => item.task.taskType === 'planning')?.modelResolution.model).toBe('gpt5.4')
+    expect(assignments.find((item) => item.task.taskType === 'planning')?.executionTarget).toMatchObject({
+      backend: 'coco',
+      model: 'gpt5.4',
+      transport: 'auto'
+    })
     expect(plan.tasks.find((task) => task.taskType === 'code-review')?.dependsOn).toEqual(['T2'])
     expect(plan.tasks.find((task) => task.taskType === 'testing')?.dependsOn).toEqual(['T2'])
     expect(plan.tasks.find((task) => task.taskType === 'coordination')?.dependsOn).toEqual(['T1', 'T2', 'T3', 'T4'])
@@ -48,12 +60,21 @@ describe('planner and dispatcher', () => {
     expect(plan.tasks.find((task) => task.taskType === 'code-review')?.maxAttempts).toBe(1)
     expect(plan.tasks.find((task) => task.taskType === 'planning')?.maxAttempts).toBe(1)
     expect(assignments.find((item) => item.task.taskType === 'coding')?.fallback?.roleDefinition.name).toBe('reviewer')
+    expect(assignments.find((item) => item.task.taskType === 'coding')?.fallback?.executionTarget).toMatchObject({
+      backend: 'coco',
+      model: 'gpt5.3-codex'
+    })
     expect(assignments.find((item) => item.task.taskType === 'testing')?.fallback?.roleDefinition.name).toBe('reviewer')
     expect(assignments.find((item) => item.task.taskType === 'testing')?.remediation?.roleDefinition.name).toBe('coder')
     expect(assignments.find((item) => item.task.taskType === 'testing')?.remediation?.taskType).toBe('coding')
     expect(assignments.find((item) => item.task.taskType === 'testing')?.remediation?.skills).toEqual(['implementation'])
     expect(assignments.find((item) => item.task.taskType === 'testing')?.remediation?.modelResolution.source).toBe('remediation')
     expect(assignments.find((item) => item.task.taskType === 'testing')?.remediation?.modelResolution.model).toBe('gpt5.3-codex-remediation')
+    expect(assignments.find((item) => item.task.taskType === 'testing')?.remediation?.executionTarget).toMatchObject({
+      backend: 'coco',
+      model: 'gpt5.3-codex-remediation',
+      source: 'remediation'
+    })
 
     const batches = buildExecutionBatches(assignments)
     expect(batches).toEqual([
@@ -242,6 +263,91 @@ describe('planner and dispatcher', () => {
     expect(result.stdout).toContain('Summary:')
     expect(result.stdout).not.toContain('"report"')
     expect(result.stdout).not.toContain('"runtime"')
+  })
+
+  it('普通 plan 命令会把 -- 当作 positional separator 而不是 goal 内容', () => {
+    const result = spawnSync(process.execPath, [tsxCliPath, cliPath, 'plan', '--', '2025', 'Q1', 'roadmap'], {
+      cwd: repoRoot,
+      encoding: 'utf8'
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.stderr).toBe('')
+
+    const output = JSON.parse(result.stdout) as {
+      plan: {
+        goal: string
+      }
+    }
+
+    expect(output.plan.goal).toBe('2025 Q1 roadmap')
+  })
+
+  it('支持通过 /harness-team 触发 run，并把 team-size 作为当前 runtime 的并发桥接值', () => {
+    const result = spawnSync(
+      process.execPath,
+      [tsxCliPath, cliPath, '/harness-team', '--adapter', 'dry-run', '3', '2:model=gpt5.4', '梳理', '登录链路现状'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8'
+      }
+    )
+
+    expect(result.status).toBe(0)
+    const runDirectoryMatch = result.stderr.match(/\[harness\] runDirectory: (.+)/)
+    expect(runDirectoryMatch?.[1]).toBeTruthy()
+
+    const runDirectory = runDirectoryMatch?.[1]?.trim()
+    const report = loadRunReport(resolve(runDirectory!, 'report.json'))
+
+    expect(report.goal).toBe('梳理 登录链路现状')
+    expect(report.runtime.maxConcurrency).toBe(3)
+    expect(report.runtime.workers).toHaveLength(3)
+    expect(report.runtime.workers.map((worker) => worker.slotId)).toEqual([1, 2, 3])
+  })
+
+  it('支持在无 slot override 时通过 --team-size 指定 team-size', () => {
+    const result = spawnSync(
+      process.execPath,
+      [tsxCliPath, cliPath, '/harness-team', '--adapter', 'dry-run', '--team-size', '3', '修复', 'watch', '视图'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8'
+      }
+    )
+
+    expect(result.status).toBe(0)
+    const runDirectoryMatch = result.stderr.match(/\[harness\] runDirectory: (.+)/)
+    expect(runDirectoryMatch?.[1]).toBeTruthy()
+
+    const runDirectory = runDirectoryMatch?.[1]?.trim()
+    const report = loadRunReport(resolve(runDirectory!, 'report.json'))
+
+    expect(report.goal).toBe('修复 watch 视图')
+    expect(report.runtime.maxConcurrency).toBe(3)
+    expect(report.runtime.workers).toHaveLength(3)
+  })
+
+  it('支持通过 -- 分隔 /harness-team 的 team-size 与数字开头 goal', () => {
+    const result = spawnSync(
+      process.execPath,
+      [tsxCliPath, cliPath, '/harness-team', '--adapter', 'dry-run', '3', '--', '2025', 'Q1', 'roadmap'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8'
+      }
+    )
+
+    expect(result.status).toBe(0)
+    const runDirectoryMatch = result.stderr.match(/\[harness\] runDirectory: (.+)/)
+    expect(runDirectoryMatch?.[1]).toBeTruthy()
+
+    const runDirectory = runDirectoryMatch?.[1]?.trim()
+    const report = loadRunReport(resolve(runDirectory!, 'report.json'))
+
+    expect(report.goal).toBe('2025 Q1 roadmap')
+    expect(report.runtime.maxConcurrency).toBe(3)
+    expect(report.runtime.workers).toHaveLength(3)
   })
 
   it('harness 脚本默认显式使用 coco-auto adapter', () => {

@@ -7,6 +7,7 @@ const slashCommandSchema = z.object({
   composition: z.string().min(1).optional(),
   teamName: z.string().min(1).optional(),
   adapter: z.string().min(1).optional(),
+  dsl: z.enum(['team-run']).optional(),
   description: z.string().min(1)
 })
 
@@ -27,6 +28,7 @@ export interface SlashCommandDefinition {
   composition?: string
   teamName?: string
   adapter?: string
+  dsl?: 'team-run'
   description: string
 }
 
@@ -41,6 +43,7 @@ export interface SlashCommandRegistry {
 export interface SlashCommandResolution {
   command: 'plan' | 'run' | 'resume'
   flags: Map<string, string>
+  dsl?: 'team-run'
 }
 
 export function loadSlashCommandRegistry(configPath: string): SlashCommandRegistry {
@@ -58,6 +61,7 @@ export function loadSlashCommandRegistry(configPath: string): SlashCommandRegist
           composition: command.composition,
           teamName: command.teamName,
           adapter: command.adapter,
+          dsl: command.dsl,
           description: command.description
         } satisfies SlashCommandDefinition
       ])
@@ -97,6 +101,7 @@ export function resolveSlashCommand(
 
   return {
     command: slashCommand.action,
-    flags: resolvedFlags
+    flags: resolvedFlags,
+    dsl: slashCommand.dsl
   }
 }

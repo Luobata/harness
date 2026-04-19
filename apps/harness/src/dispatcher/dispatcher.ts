@@ -1,6 +1,6 @@
 import type { DispatchAssignment, Plan, RoleDefinition, TaskType } from '../domain/types.js'
 import type { RoleModelConfig } from '../role-model-config/schema.js'
-import { resolveModelWithOverride } from '../role-model-config/resolver.js'
+import { resolveExecutionTarget, resolveModelWithOverride } from '../role-model-config/resolver.js'
 
 function requireRoleDefinition(roleRegistry: Map<string, RoleDefinition>, roleName: string, label: string): RoleDefinition {
   const roleDefinition = roleRegistry.get(roleName)
@@ -30,6 +30,16 @@ function resolveTarget(params: {
   return {
     roleDefinition,
     modelResolution: resolveModelWithOverride(
+      modelConfig,
+      {
+        role: roleName,
+        taskType,
+        skills,
+        teamName
+      },
+      overrideModel
+    ),
+    executionTarget: resolveExecutionTarget(
       modelConfig,
       {
         role: roleName,
@@ -135,6 +145,12 @@ export function dispatchPlan(
       task,
       roleDefinition,
       modelResolution: resolveModelWithOverride(modelConfig, {
+        role: task.role,
+        taskType: task.taskType,
+        skills: task.skills,
+        teamName
+      }),
+      executionTarget: resolveExecutionTarget(modelConfig, {
         role: task.role,
         taskType: task.taskType,
         skills: task.skills,

@@ -33,7 +33,11 @@ export async function runGoal(params: {
     assignments,
     batches,
     adapter,
-    workerPool: { maxConcurrency }
+    workerPool: {
+      maxConcurrency,
+      slotCount: input.teamRunSpec?.teamSize,
+      slots: input.teamRunSpec?.slots
+    }
   })
 
   return {

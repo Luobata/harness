@@ -158,7 +158,7 @@ export function buildCocoPrompt(
   promptTemplates?: RolePromptTemplateRegistry,
   skillRegistry?: SkillRegistry
 ): string {
-  const { task, modelResolution, roleDefinition } = assignment
+  const { task, modelResolution, roleDefinition, executionTarget } = assignment
   const acceptance = task.acceptanceCriteria.map((item, index) => `${index + 1}. ${item}`).join('\n')
   const dependencySection =
     dependencyResults.length === 0
@@ -177,8 +177,13 @@ export function buildCocoPrompt(
     `任务ID: ${task.id}`,
     `角色: ${roleDefinition.name}`,
     `任务类型: ${task.taskType}`,
-    `模型要求: ${modelResolution.model}`,
-    `模型来源: ${modelResolution.source}`,
+    `执行后端: ${executionTarget.backend}`,
+    `模型要求: ${executionTarget.model}`,
+    `模型来源: ${executionTarget.source}`,
+    `策略来源: ${modelResolution.source}`,
+    executionTarget.profile ? `执行 profile: ${executionTarget.profile}` : null,
+    executionTarget.command ? `执行命令: ${executionTarget.command}` : null,
+    `传输模式: ${executionTarget.transport}`,
     `任务标题: ${task.title}`,
     `任务描述: ${task.description}`,
     ...dependencySection,
@@ -186,7 +191,7 @@ export function buildCocoPrompt(
     acceptance,
     '你必须只输出 JSON，不要输出 markdown 代码块，不要输出额外解释。',
     'JSON schema: {"status":"completed|failed","summary":"string"}'
-  ].join('\n')
+  ].filter((line): line is string => Boolean(line)).join('\n')
 }
 
 function parseJsonObject(raw: string): CocoStructuredOutput | null {
@@ -276,6 +281,85 @@ export function buildCocoPtyCliArgs(params: {
   return args
 }
 
+function buildClaudeCliArgs(params: {
+  prompt: string
+  mode: 'print' | 'pty'
+  model: string
+  profile?: string
+}): string[] {
+  const args = ['--dangerously-skip-permissions']
+
+  if (params.profile) {
+    args.push('--profile', params.profile)
+  }
+
+  if (params.model) {
+    args.push('--model', params.model)
+  }
+
+  if (params.mode === 'print') {
+    args.push('--print')
+  }
+
+  args.push(params.prompt)
+  return args
+}
+
+function resolveExecutionCommand(assignment: DispatchAssignment, defaultCommand: string): string {
+  const explicitCommand = assignment.executionTarget.command?.trim()
+  if (explicitCommand) {
+    return explicitCommand
+  }
+
+  switch (assignment.executionTarget.backend) {
+    case 'coco':
+      return defaultCommand
+    case 'claude-code':
+      return 'claude'
+    case 'local-cc':
+      return 'cc'
+  }
+}
+
+function buildExecutionCliArgs(params: {
+  assignment: DispatchAssignment
+  prompt: string
+  timeoutMs: number
+  allowedTools: string[]
+  yolo: boolean
+  mode: 'print' | 'pty'
+}): string[] {
+  const { assignment, prompt, timeoutMs, allowedTools, yolo, mode } = params
+
+  switch (assignment.executionTarget.backend) {
+    case 'coco':
+      return (mode === 'pty' ? buildCocoPtyCliArgs : buildCocoCliArgs)({
+        prompt,
+        timeoutMs,
+        allowedTools,
+        yolo
+      })
+    case 'claude-code':
+    case 'local-cc':
+      return buildClaudeCliArgs({
+        prompt,
+        mode,
+        model: assignment.executionTarget.model,
+        profile: assignment.executionTarget.profile
+      })
+  }
+}
+
+function buildExecutionResultMetadata(assignment: DispatchAssignment): Pick<TaskExecutionResult, 'model' | 'backend' | 'command' | 'transport' | 'profile'> {
+  return {
+    model: assignment.executionTarget.model,
+    backend: assignment.executionTarget.backend,
+    command: assignment.executionTarget.command ?? null,
+    transport: assignment.executionTarget.transport,
+    profile: assignment.executionTarget.profile ?? null
+  }
+}
+
 function stripTerminalControl(raw: string): string {
   return raw
     .replace(/\u001b\][^\u0007]*\u0007/g, '')
@@ -360,12 +444,15 @@ async function executeWithRunner(params: {
 }): Promise<CocoExecutionOutcome> {
   const { assignment, dependencyResults, timeoutMs, allowedTools, yolo, mode, runner, promptTemplates, skillRegistry } = params
   const prompt = buildCocoPrompt(assignment, dependencyResults, promptTemplates, skillRegistry)
-  const args = (mode === 'pty' ? buildCocoPtyCliArgs : buildCocoCliArgs)({
+  const args = buildExecutionCliArgs({
+    assignment,
     prompt,
     timeoutMs,
     allowedTools,
-    yolo
+    yolo,
+    mode
   })
+  const resultMetadata = buildExecutionResultMetadata(assignment)
 
   try {
     const { stdout, stderr } = await runner.run(args, timeoutMs)
@@ -377,9 +464,9 @@ async function executeWithRunner(params: {
       result: {
         taskId: assignment.task.id,
         role: assignment.roleDefinition.name,
-        model: assignment.modelResolution.model,
+        ...resultMetadata,
         status: parsed?.status === 'failed' ? 'failed' : 'completed',
-        summary: parsed?.summary?.trim() || normalizedStdout.trim() || stderr.trim() || 'coco 未返回 summary',
+        summary: parsed?.summary?.trim() || normalizedStdout.trim() || stderr.trim() || `${assignment.executionTarget.backend} 未返回 summary`,
         attempt: 1
       }
     }
@@ -399,9 +486,9 @@ async function executeWithRunner(params: {
       result: {
         taskId: assignment.task.id,
         role: assignment.roleDefinition.name,
-        model: assignment.modelResolution.model,
+        ...resultMetadata,
         status: 'failed',
-        summary: parts.join(' | ') || 'coco 执行失败',
+        summary: parts.join(' | ') || `${assignment.executionTarget.backend} 执行失败`,
         attempt: 1
       }
     }
@@ -433,7 +520,7 @@ function summarizeFallbackOutcome(label: 'print' | 'pty', outcome: CocoExecution
 }
 
 export class CocoCliAdapter implements CocoAdapter {
-  private readonly command: string
+  private readonly defaultCommand: string
   private readonly timeoutMs: number
   private readonly allowedTools: string[]
   private readonly yolo: boolean
@@ -443,25 +530,39 @@ export class CocoCliAdapter implements CocoAdapter {
   private readonly skillRegistry?: SkillRegistry
 
   constructor(options: CocoCliAdapterOptions = {}) {
-    this.command = options.command ?? 'coco'
+    this.defaultCommand = options.command ?? 'coco'
     this.timeoutMs = options.timeoutMs ?? 120000
     this.allowedTools = options.allowedTools ?? []
     this.yolo = options.yolo ?? false
     this.mode = options.mode ?? 'print'
-    this.runner = options.runner ?? (this.mode === 'pty' ? new PtyCocoRunner(this.command) : new ProcessCocoRunner(this.command))
+    this.runner = options.runner ?? (this.mode === 'pty' ? new PtyCocoRunner(this.defaultCommand) : new ProcessCocoRunner(this.defaultCommand))
     this.promptTemplates = options.promptTemplates
     this.skillRegistry = options.skillRegistry
   }
 
+  private resolveMode(assignment: DispatchAssignment): 'print' | 'pty' {
+    return assignment.executionTarget.transport === 'auto' ? this.mode : assignment.executionTarget.transport
+  }
+
+  private createRunner(mode: 'print' | 'pty', assignment: DispatchAssignment): CocoRunner {
+    const command = resolveExecutionCommand(assignment, this.defaultCommand)
+    if (command === this.defaultCommand && mode === this.mode) {
+      return this.runner
+    }
+
+    return mode === 'pty' ? new PtyCocoRunner(command) : new ProcessCocoRunner(command)
+  }
+
   async execute({ assignment, dependencyResults }: CocoExecutionRequest): Promise<TaskExecutionResult> {
+    const mode = this.resolveMode(assignment)
     const outcome = await executeWithRunner({
       assignment,
       dependencyResults,
       timeoutMs: this.timeoutMs,
       allowedTools: this.allowedTools,
       yolo: this.yolo,
-      mode: this.mode,
-      runner: this.runner,
+      mode,
+      runner: this.createRunner(mode, assignment),
       promptTemplates: this.promptTemplates,
       skillRegistry: this.skillRegistry
     })
@@ -471,6 +572,7 @@ export class CocoCliAdapter implements CocoAdapter {
 }
 
 export class AutoFallbackCocoAdapter implements CocoAdapter {
+  private readonly defaultCommand: string
   private readonly timeoutMs: number
   private readonly allowedTools: string[]
   private readonly yolo: boolean
@@ -480,17 +582,42 @@ export class AutoFallbackCocoAdapter implements CocoAdapter {
   private readonly skillRegistry?: SkillRegistry
 
   constructor(options: AutoFallbackCocoAdapterOptions = {}) {
-    const command = options.command ?? 'coco'
+    this.defaultCommand = options.command ?? 'coco'
     this.timeoutMs = options.timeoutMs ?? 120000
     this.allowedTools = options.allowedTools ?? []
     this.yolo = options.yolo ?? false
-    this.printRunner = options.printRunner ?? new ProcessCocoRunner(command)
-    this.ptyRunner = options.ptyRunner ?? new PtyCocoRunner(command)
+    this.printRunner = options.printRunner ?? new ProcessCocoRunner(this.defaultCommand)
+    this.ptyRunner = options.ptyRunner ?? new PtyCocoRunner(this.defaultCommand)
     this.promptTemplates = options.promptTemplates
     this.skillRegistry = options.skillRegistry
   }
 
+  private createRunner(mode: 'print' | 'pty', assignment: DispatchAssignment): CocoRunner {
+    const command = resolveExecutionCommand(assignment, this.defaultCommand)
+    if (command === this.defaultCommand) {
+      return mode === 'print' ? this.printRunner : this.ptyRunner
+    }
+
+    return mode === 'print' ? new ProcessCocoRunner(command) : new PtyCocoRunner(command)
+  }
+
   async execute({ assignment, dependencyResults }: CocoExecutionRequest): Promise<TaskExecutionResult> {
+    if (assignment.executionTarget.transport === 'print' || assignment.executionTarget.transport === 'pty') {
+      const outcome = await executeWithRunner({
+        assignment,
+        dependencyResults,
+        timeoutMs: this.timeoutMs,
+        allowedTools: this.allowedTools,
+        yolo: this.yolo,
+        mode: assignment.executionTarget.transport,
+        runner: this.createRunner(assignment.executionTarget.transport, assignment),
+        promptTemplates: this.promptTemplates,
+        skillRegistry: this.skillRegistry
+      })
+
+      return outcome.result
+    }
+
     const printOutcome = await executeWithRunner({
       assignment,
       dependencyResults,
@@ -498,7 +625,7 @@ export class AutoFallbackCocoAdapter implements CocoAdapter {
       allowedTools: this.allowedTools,
       yolo: this.yolo,
       mode: 'print',
-      runner: this.printRunner,
+      runner: this.createRunner('print', assignment),
       promptTemplates: this.promptTemplates,
       skillRegistry: this.skillRegistry
     })
@@ -514,7 +641,7 @@ export class AutoFallbackCocoAdapter implements CocoAdapter {
       allowedTools: this.allowedTools,
       yolo: this.yolo,
       mode: 'pty',
-      runner: this.ptyRunner,
+      runner: this.createRunner('pty', assignment),
       promptTemplates: this.promptTemplates,
       skillRegistry: this.skillRegistry
     })
@@ -526,7 +653,7 @@ export class AutoFallbackCocoAdapter implements CocoAdapter {
     return {
       taskId: assignment.task.id,
       role: assignment.roleDefinition.name,
-      model: assignment.modelResolution.model,
+      ...buildExecutionResultMetadata(assignment),
       status: 'failed',
       summary: [summarizeFallbackOutcome('print', printOutcome), summarizeFallbackOutcome('pty', ptyOutcome)].join(' | '),
       attempt: 1
@@ -541,16 +668,19 @@ export class DryRunCocoAdapter implements CocoAdapter {
     return {
       taskId: task.id,
       role: roleDefinition.name,
-      model: modelResolution.model,
+      ...buildExecutionResultMetadata(assignment),
       status: 'completed',
       attempt: 1,
       summary: [
         `[dry-run] role=${roleDefinition.name}`,
         `taskType=${task.taskType}`,
-        `model=${modelResolution.model}`,
+        `backend=${assignment.executionTarget.backend}`,
+        `model=${assignment.executionTarget.model}`,
+        `transport=${assignment.executionTarget.transport}`,
+        assignment.executionTarget.profile ? `profile=${assignment.executionTarget.profile}` : null,
         `source=${modelResolution.source}`,
         `reason=${modelResolution.reason}`
-      ].join(' | ')
+      ].filter((item): item is string => Boolean(item)).join(' | ')
     }
   }
 }

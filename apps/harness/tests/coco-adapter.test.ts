@@ -1,3 +1,5 @@
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
@@ -10,6 +12,84 @@ import { buildSkillRegistry } from '../src/team/skill-registry.js'
 
 const skillsConfigPath = resolve(import.meta.dirname, '../configs/skills.yaml')
 const skillRegistry = buildSkillRegistry(loadSkills(skillsConfigPath))
+
+function createRecordingCli(params: {
+  directory: string
+  name: string
+  recordPath: string
+  behavior?: 'success' | 'print-bad-pty-good'
+}): string {
+  const { directory, name, recordPath, behavior = 'success' } = params
+  const scriptPath = resolve(directory, name)
+  writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs');
+const { basename } = require('node:path');
+
+const bin = basename(process.argv[1]);
+const argv = process.argv.slice(2);
+appendFileSync(${JSON.stringify(recordPath)}, JSON.stringify({ bin, argv, stdoutIsTTY: Boolean(process.stdout.isTTY) }) + "\\n", 'utf8');
+
+if (${JSON.stringify(behavior)} === 'print-bad-pty-good') {
+  const isPrint = argv.includes('-p') || argv.includes('--print');
+  if (isPrint) {
+    process.stdout.write('Explore(');
+    process.exit(0);
+  }
+
+  process.stdout.write('✽ Thinking...\\n');
+  setTimeout(() => {
+    process.stdout.write('⏺ {"status":"completed","summary":"pty recovered real"}\\n');
+    setTimeout(() => process.exit(0), 50);
+  }, 50);
+  return;
+}
+
+process.stdout.write(JSON.stringify({ status: 'completed', summary: bin + ' ok' }));
+`,
+    'utf8'
+  )
+  chmodSync(scriptPath, 0o755)
+  return scriptPath
+}
+
+function createPtyRecordingCli(params: {
+  directory: string
+  name: string
+  recordPath: string
+  summary: string
+}): string {
+  const { directory, name, recordPath, summary } = params
+  const scriptPath = resolve(directory, name)
+  writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs');
+const { basename } = require('node:path');
+
+const bin = basename(process.argv[1]);
+const argv = process.argv.slice(2);
+appendFileSync(${JSON.stringify(recordPath)}, JSON.stringify({ bin, argv, stdoutIsTTY: Boolean(process.stdout.isTTY) }) + "\\n", 'utf8');
+process.stdout.write('✽ Thinking...\\n');
+setTimeout(() => {
+  process.stdout.write('⏺ {"status":"completed","summary":${JSON.stringify(summary)}}\\n');
+  setTimeout(() => process.exit(0), 50);
+}, 50);
+`,
+    'utf8'
+  )
+  chmodSync(scriptPath, 0o755)
+  return scriptPath
+}
+
+function readRecordedInvocations(recordPath: string): Array<{ bin: string; argv: string[]; stdoutIsTTY?: boolean }> {
+  return readFileSync(recordPath, 'utf8')
+    .trim()
+    .split('\n')
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as { bin: string; argv: string[]; stdoutIsTTY?: boolean })
+}
 
 const assignment: DispatchAssignment = {
   task: {
@@ -34,6 +114,13 @@ const assignment: DispatchAssignment = {
     model: 'gpt5.3-codex',
     source: 'taskType',
     reason: 'taskType=coding 命中 taskTypes 配置'
+  },
+  executionTarget: {
+    backend: 'coco',
+    model: 'gpt5.3-codex',
+    source: 'taskType',
+    reason: 'taskType=coding 命中 taskTypes 配置',
+    transport: 'auto'
   },
   fallback: null,
   remediation: null
@@ -106,6 +193,36 @@ describe('coco adapter', () => {
     expect(prompt).toContain('你是外部配置的实现者。')
   })
 
+  it('prompt 会优先注入 executionTarget 字段而不是旧的 modelResolution 元数据', () => {
+    const targetAwareAssignment: DispatchAssignment = {
+      ...assignment,
+      modelResolution: {
+        model: 'legacy-model',
+        source: 'taskType',
+        reason: 'old resolution metadata'
+      },
+      executionTarget: {
+        backend: 'local-cc',
+        model: 'target-model',
+        profile: 'cc-target',
+        command: 'custom-cc',
+        source: 'slot-override',
+        reason: 'slot override target',
+        transport: 'pty'
+      }
+    }
+
+    const prompt = buildCocoPrompt(targetAwareAssignment, [], undefined, skillRegistry)
+
+    expect(prompt).toContain('执行后端: local-cc')
+    expect(prompt).toContain('模型要求: target-model')
+    expect(prompt).toContain('模型来源: slot-override')
+    expect(prompt).toContain('策略来源: taskType')
+    expect(prompt).toContain('执行 profile: cc-target')
+    expect(prompt).toContain('执行命令: custom-cc')
+    expect(prompt).toContain('传输模式: pty')
+  })
+
   it('解析 coco JSON 输出', async () => {
     const adapter = new CocoCliAdapter({
       runner: {
@@ -122,7 +239,263 @@ describe('coco adapter', () => {
     expect(result.status).toBe('completed')
     expect(result.summary).toBe('mock success')
     expect(result.model).toBe('gpt5.3-codex')
+    expect(result.backend).toBe('coco')
+    expect(result.transport).toBe('auto')
     expect(result.attempt).toBe(1)
+  })
+
+  it('执行结果回填 executionTarget 元数据', async () => {
+    const targetAwareAssignment: DispatchAssignment = {
+      ...assignment,
+      executionTarget: {
+        backend: 'local-cc',
+        model: 'sonnet',
+        profile: 'cc-local',
+        command: 'cc',
+        source: 'slot-override',
+        reason: 'slot 2 override',
+        transport: 'print'
+      }
+    }
+    const adapter = new CocoCliAdapter({
+      runner: {
+        async run() {
+          return {
+            stdout: '{"status":"completed","summary":"slot routed"}',
+            stderr: ''
+          }
+        }
+      }
+    })
+
+    const result = await adapter.execute({ assignment: targetAwareAssignment, dependencyResults: [] })
+
+    expect(result.model).toBe('sonnet')
+    expect(result.backend).toBe('local-cc')
+    expect(result.profile).toBe('cc-local')
+    expect(result.command).toBe('cc')
+    expect(result.transport).toBe('print')
+  })
+
+  it('默认命令下也会按 executionTarget.transport 切到真实 PTY runner', async () => {
+    const tempRoot = mkdtempSync(resolve(tmpdir(), 'harness-coco-pty-route-'))
+    const binDir = resolve(tempRoot, 'bin')
+    mkdirSync(binDir, { recursive: true })
+    const recordPath = resolve(tempRoot, 'pty-route-record.ndjson')
+    createPtyRecordingCli({ directory: binDir, name: 'cc', recordPath, summary: 'pty route ok' })
+
+    const transportAwareAssignment: DispatchAssignment = {
+      ...assignment,
+      executionTarget: {
+        backend: 'local-cc',
+        model: 'sonnet-pty',
+        profile: 'cc-pty',
+        source: 'slot-override',
+        reason: 'transport routing test',
+        transport: 'pty'
+      }
+    }
+    const previousPath = process.env.PATH ?? ''
+    process.env.PATH = `${binDir}:${previousPath}`
+
+    try {
+      const adapter = new CocoCliAdapter({ mode: 'print' })
+      const result = await adapter.execute({ assignment: transportAwareAssignment, dependencyResults: [] })
+      const [invocation] = readRecordedInvocations(recordPath)
+
+      expect(result.summary).toBe('pty route ok')
+      expect(result.transport).toBe('pty')
+      expect(invocation?.bin).toBe('cc')
+      expect(invocation?.stdoutIsTTY).toBe(true)
+      expect(invocation?.argv).toEqual(expect.arrayContaining(['--dangerously-skip-permissions', '--profile', 'cc-pty', '--model', 'sonnet-pty']))
+      expect(invocation?.argv).not.toContain('--print')
+    } finally {
+      process.env.PATH = previousPath
+    }
+  })
+
+  it('未显式 command 时会按 backend 路由到 claude 与 cc', async () => {
+    const tempRoot = mkdtempSync(resolve(tmpdir(), 'harness-coco-backend-route-'))
+    const binDir = resolve(tempRoot, 'bin')
+    mkdirSync(binDir, { recursive: true })
+    const recordPath = resolve(tempRoot, 'backend-record.ndjson')
+    createRecordingCli({ directory: binDir, name: 'claude', recordPath })
+    createRecordingCli({ directory: binDir, name: 'cc', recordPath })
+
+    const previousPath = process.env.PATH ?? ''
+    process.env.PATH = `${binDir}:${previousPath}`
+
+    try {
+      const claudeAssignment: DispatchAssignment = {
+        ...assignment,
+        executionTarget: {
+          backend: 'claude-code',
+          model: 'sonnet',
+          profile: 'review-profile',
+          source: 'role',
+          reason: 'review role target',
+          transport: 'print'
+        }
+      }
+      const localCcAssignment: DispatchAssignment = {
+        ...assignment,
+        executionTarget: {
+          backend: 'local-cc',
+          model: 'sonnet-local',
+          profile: 'cc-local',
+          source: 'slot-override',
+          reason: 'slot 2 local cc',
+          transport: 'print'
+        }
+      }
+
+      const adapter = new CocoCliAdapter()
+      const claudeResult = await adapter.execute({ assignment: claudeAssignment, dependencyResults: [] })
+      const localCcResult = await adapter.execute({ assignment: localCcAssignment, dependencyResults: [] })
+      const invocations = readRecordedInvocations(recordPath)
+      const claudeInvocation = invocations.find((item) => item.bin === 'claude')
+      const localCcInvocation = invocations.find((item) => item.bin === 'cc')
+
+      expect(claudeResult.summary).toBe('claude ok')
+      expect(localCcResult.summary).toBe('cc ok')
+      expect(claudeInvocation?.argv).toEqual(expect.arrayContaining(['--dangerously-skip-permissions', '--profile', 'review-profile', '--model', 'sonnet', '--print']))
+      expect(localCcInvocation?.argv).toEqual(expect.arrayContaining(['--dangerously-skip-permissions', '--profile', 'cc-local', '--model', 'sonnet-local', '--print']))
+    } finally {
+      process.env.PATH = previousPath
+    }
+  })
+
+  it('coco-auto 在固定 transport 下也会按 backend 路由到对应命令', async () => {
+    const tempRoot = mkdtempSync(resolve(tmpdir(), 'harness-coco-auto-route-'))
+    const binDir = resolve(tempRoot, 'bin')
+    mkdirSync(binDir, { recursive: true })
+    const recordPath = resolve(tempRoot, 'auto-route-record.ndjson')
+    createRecordingCli({ directory: binDir, name: 'claude', recordPath })
+    createRecordingCli({ directory: binDir, name: 'cc', recordPath })
+
+    const previousPath = process.env.PATH ?? ''
+    process.env.PATH = `${binDir}:${previousPath}`
+
+    try {
+      const autoAdapter = new AutoFallbackCocoAdapter()
+      const claudeAssignment: DispatchAssignment = {
+        ...assignment,
+        executionTarget: {
+          backend: 'claude-code',
+          model: 'sonnet-auto',
+          profile: 'review-auto',
+          source: 'role',
+          reason: 'auto claude route',
+          transport: 'print'
+        }
+      }
+      const localCcAssignment: DispatchAssignment = {
+        ...assignment,
+        executionTarget: {
+          backend: 'local-cc',
+          model: 'cc-sonnet-auto',
+          profile: 'cc-auto',
+          source: 'slot-override',
+          reason: 'auto local cc route',
+          transport: 'print'
+        }
+      }
+
+      const claudeResult = await autoAdapter.execute({ assignment: claudeAssignment, dependencyResults: [] })
+      const localCcResult = await autoAdapter.execute({ assignment: localCcAssignment, dependencyResults: [] })
+      const invocations = readRecordedInvocations(recordPath)
+      const claudeInvocations = invocations.filter((item) => item.bin === 'claude')
+      const localCcInvocations = invocations.filter((item) => item.bin === 'cc')
+      const claudeInvocation = claudeInvocations[0]
+      const localCcInvocation = localCcInvocations[0]
+
+      expect(claudeResult.summary).toBe('claude ok')
+      expect(localCcResult.summary).toBe('cc ok')
+      expect(invocations).toHaveLength(2)
+      expect(claudeInvocations).toHaveLength(1)
+      expect(localCcInvocations).toHaveLength(1)
+      expect(claudeInvocation?.argv).toEqual(expect.arrayContaining(['--dangerously-skip-permissions', '--profile', 'review-auto', '--model', 'sonnet-auto', '--print']))
+      expect(localCcInvocation?.argv).toEqual(expect.arrayContaining(['--dangerously-skip-permissions', '--profile', 'cc-auto', '--model', 'cc-sonnet-auto', '--print']))
+    } finally {
+      process.env.PATH = previousPath
+    }
+  })
+
+  it('coco-auto 在固定 transport=pty 下会直接走 PTY backend 命令', async () => {
+    const tempRoot = mkdtempSync(resolve(tmpdir(), 'harness-coco-auto-pty-'))
+    const binDir = resolve(tempRoot, 'bin')
+    mkdirSync(binDir, { recursive: true })
+    const recordPath = resolve(tempRoot, 'auto-pty-record.ndjson')
+    createPtyRecordingCli({ directory: binDir, name: 'cc', recordPath, summary: 'auto pty ok' })
+
+    const previousPath = process.env.PATH ?? ''
+    process.env.PATH = `${binDir}:${previousPath}`
+
+    try {
+      const autoPtyAssignment: DispatchAssignment = {
+        ...assignment,
+        executionTarget: {
+          backend: 'local-cc',
+          model: 'cc-pty-auto',
+          profile: 'cc-auto-pty',
+          source: 'slot-override',
+          reason: 'auto adapter pty route',
+          transport: 'pty'
+        }
+      }
+
+      const adapter = new AutoFallbackCocoAdapter()
+      const result = await adapter.execute({ assignment: autoPtyAssignment, dependencyResults: [] })
+      const [invocation] = readRecordedInvocations(recordPath)
+
+      expect(result.status).toBe('completed')
+      expect(result.summary).toBe('auto pty ok')
+      expect(result.transport).toBe('pty')
+      expect(invocation?.bin).toBe('cc')
+      expect(invocation?.stdoutIsTTY).toBe(true)
+      expect(invocation?.argv).toEqual(expect.arrayContaining(['--dangerously-skip-permissions', '--profile', 'cc-auto-pty', '--model', 'cc-pty-auto']))
+      expect(invocation?.argv).not.toContain('--print')
+    } finally {
+      process.env.PATH = previousPath
+    }
+  })
+
+  it('显式 executionTarget.command 会优先于 backend 默认命令', async () => {
+    const tempRoot = mkdtempSync(resolve(tmpdir(), 'harness-coco-command-priority-'))
+    const binDir = resolve(tempRoot, 'bin')
+    mkdirSync(binDir, { recursive: true })
+    const recordPath = resolve(tempRoot, 'command-priority-record.ndjson')
+    createRecordingCli({ directory: binDir, name: 'custom-cc', recordPath })
+    createRecordingCli({ directory: binDir, name: 'cc', recordPath })
+
+    const previousPath = process.env.PATH ?? ''
+    process.env.PATH = `${binDir}:${previousPath}`
+
+    try {
+      const commandAwareAssignment: DispatchAssignment = {
+        ...assignment,
+        executionTarget: {
+          backend: 'local-cc',
+          model: 'sonnet-custom',
+          profile: 'cc-custom',
+          command: 'custom-cc',
+          source: 'slot-override',
+          reason: 'explicit command should win',
+          transport: 'print'
+        }
+      }
+
+      const adapter = new CocoCliAdapter()
+      const result = await adapter.execute({ assignment: commandAwareAssignment, dependencyResults: [] })
+      const invocations = readRecordedInvocations(recordPath)
+
+      expect(result.summary).toBe('custom-cc ok')
+      expect(invocations).toHaveLength(1)
+      expect(invocations[0]?.bin).toBe('custom-cc')
+      expect(invocations[0]?.argv).toEqual(expect.arrayContaining(['--dangerously-skip-permissions', '--profile', 'cc-custom', '--model', 'sonnet-custom', '--print']))
+    } finally {
+      process.env.PATH = previousPath
+    }
   })
 
   it('在非 JSON 输出时回退为原始 summary', async () => {

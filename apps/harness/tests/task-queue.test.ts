@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { DispatchAssignment } from '../src/domain/types.js'
 import type { CocoAdapter } from '../src/runtime/coco-adapter.js'
+import { readAllRuntimeEvents } from '../src/runtime/event-stream.js'
 import { runAssignmentsWithRuntime } from '../src/runtime/team-runtime.js'
 import { getQueuePath, getTaskRecordPath, getTaskStorePath } from '../src/runtime/task-store.js'
 import { createTaskQueue, loadTaskQueue, rerouteFailedTask, retryFailedTask } from '../src/runtime/task-queue.js'
@@ -35,6 +36,13 @@ function createAssignments(taskIds: string[]): DispatchAssignment[] {
       model: 'gpt5.3-codex',
       source: 'taskType',
       reason: 'coding'
+    },
+    executionTarget: {
+      backend: 'coco',
+      model: 'gpt5.3-codex',
+      source: 'taskType',
+      reason: 'coding',
+      transport: 'auto'
     },
     fallback: null,
     remediation: null
@@ -181,6 +189,339 @@ describe('task queue', () => {
     expect(results).toHaveLength(3)
   })
 
+  it('显式 slotCount 大于任务数时仍保留完整 slot worker 池', () => {
+    const runDirectory = mkdtempSync(resolve(tmpdir(), 'harness-worker-slots-'))
+    const assignments = createAssignments(['T1'])
+
+    const queue = createTaskQueue({
+      runDirectory,
+      goal: 'slot goal',
+      plan: {
+        goal: 'slot goal',
+        summary: 'slot summary',
+        tasks: assignments.map((assignment) => assignment.task)
+      },
+      assignments,
+      batches: [{ batchId: 'B1', taskIds: ['T1'] }],
+      workerPool: { maxConcurrency: 3, slotCount: 3 }
+    })
+
+    expect(queue.getRuntimeSnapshot().workers).toHaveLength(3)
+    expect(queue.getRuntimeSnapshot().workers.map((worker) => worker.slotId)).toEqual([1, 2, 3])
+  })
+
+  it('claim 任务时会应用 slot execution target override', () => {
+    const runDirectory = mkdtempSync(resolve(tmpdir(), 'harness-worker-slot-target-'))
+    const assignments = createAssignments(['T1'])
+
+    const queue = createTaskQueue({
+      runDirectory,
+      goal: 'slot target goal',
+      plan: {
+        goal: 'slot target goal',
+        summary: 'slot target summary',
+        tasks: assignments.map((assignment) => assignment.task)
+      },
+      assignments,
+      batches: [{ batchId: 'B1', taskIds: ['T1'] }],
+      workerPool: {
+        maxConcurrency: 2,
+        slotCount: 2,
+        slots: [
+          { slotId: 1, backend: 'coco', model: 'gpt5.3-codex' },
+          { slotId: 2, backend: 'local-cc', model: 'sonnet', profile: 'cc-local' }
+        ]
+      }
+    })
+
+    const firstClaim = queue.claimNextTask('W2')
+
+    expect(firstClaim?.assignment.executionTarget.backend).toBe('local-cc')
+    expect(firstClaim?.assignment.executionTarget.model).toBe('sonnet')
+    expect(firstClaim?.assignment.executionTarget.profile).toBe('cc-local')
+    expect(firstClaim?.assignment.executionTarget.source).toBe('slot-override')
+    expect(queue.getRuntimeSnapshot().workers.find((worker) => worker.workerId === 'W2')).toMatchObject({
+      backend: 'local-cc',
+      configuredModel: 'sonnet',
+      profile: 'cc-local',
+      model: 'sonnet'
+    })
+  })
+
+  it('slot 仅覆写 backend 时不会继承旧 backend 的 profile', () => {
+    const runDirectory = mkdtempSync(resolve(tmpdir(), 'harness-worker-slot-backend-profile-'))
+    const assignments = createAssignments(['T1'])
+    assignments[0]!.executionTarget = {
+      backend: 'claude-code',
+      model: 'sonnet',
+      profile: 'review-profile',
+      source: 'role',
+      reason: 'review role override',
+      transport: 'print'
+    }
+
+    const queue = createTaskQueue({
+      runDirectory,
+      goal: 'slot backend reset goal',
+      plan: {
+        goal: 'slot backend reset goal',
+        summary: 'slot backend reset summary',
+        tasks: assignments.map((assignment) => assignment.task)
+      },
+      assignments,
+      batches: [{ batchId: 'B1', taskIds: ['T1'] }],
+      workerPool: {
+        maxConcurrency: 1,
+        slotCount: 1,
+        slots: [{ slotId: 1, backend: 'local-cc' }]
+      }
+    })
+
+    const claim = queue.claimNextTask('W1')
+
+    expect(claim?.assignment.executionTarget).toMatchObject({
+      backend: 'local-cc',
+      model: 'sonnet',
+      profile: undefined,
+      source: 'slot-override',
+      command: undefined
+    })
+    expect(queue.getRuntimeSnapshot().workers.find((worker) => worker.workerId === 'W1')).toMatchObject({
+      backend: 'local-cc',
+      configuredModel: 'sonnet',
+      profile: null,
+      model: 'sonnet'
+    })
+  })
+
+  it('claim 任务时会把 assignment execution target 元数据回填到 worker snapshot', () => {
+    const runDirectory = mkdtempSync(resolve(tmpdir(), 'harness-worker-assignment-target-'))
+    const assignments = createAssignments(['T1'])
+    assignments[0]!.executionTarget = {
+      backend: 'claude-code',
+      model: 'sonnet',
+      profile: 'review-profile',
+      source: 'role',
+      reason: 'review role override',
+      transport: 'print'
+    }
+
+    const queue = createTaskQueue({
+      runDirectory,
+      goal: 'assignment target goal',
+      plan: {
+        goal: 'assignment target goal',
+        summary: 'assignment target summary',
+        tasks: assignments.map((assignment) => assignment.task)
+      },
+      assignments,
+      batches: [{ batchId: 'B1', taskIds: ['T1'] }],
+      workerPool: { maxConcurrency: 1 }
+    })
+
+    const claim = queue.claimNextTask('W1')
+
+    expect(claim?.assignment.executionTarget).toMatchObject({
+      backend: 'claude-code',
+      model: 'sonnet',
+      profile: 'review-profile',
+      transport: 'print'
+    })
+    expect(queue.getRuntimeSnapshot().workers.find((worker) => worker.workerId === 'W1')).toMatchObject({
+      backend: 'claude-code',
+      configuredModel: 'sonnet',
+      profile: 'review-profile',
+      transport: 'print',
+      model: 'sonnet'
+    })
+  })
+
+  it('reroute remediation target 时会同步 taskType 与 skills', () => {
+    const runDirectory = mkdtempSync(resolve(tmpdir(), 'harness-reroute-remediation-'))
+    const assignments = createAssignments(['T1'])
+    assignments[0]!.task.role = 'reviewer'
+    assignments[0]!.task.taskType = 'testing'
+    assignments[0]!.task.skills = ['verification']
+    assignments[0]!.roleDefinition = {
+      name: 'reviewer',
+      description: 'reviewer',
+      defaultTaskTypes: ['testing'],
+      defaultSkills: ['verification']
+    }
+    assignments[0]!.remediation = {
+      roleDefinition: {
+        name: 'coder',
+        description: 'coder',
+        defaultTaskTypes: ['coding'],
+        defaultSkills: ['implementation']
+      },
+      modelResolution: {
+        model: 'gpt5.4',
+        source: 'remediation',
+        reason: 'testing needs code fix'
+      },
+      executionTarget: {
+        backend: 'local-cc',
+        model: 'gpt5.4',
+        profile: 'fix-profile',
+        source: 'remediation',
+        reason: 'testing needs code fix',
+        transport: 'print'
+      },
+      taskType: 'coding',
+      skills: ['implementation', 'bugfix']
+    }
+
+    const queue = createTaskQueue({
+      runDirectory,
+      goal: 'reroute remediation goal',
+      plan: {
+        goal: 'reroute remediation goal',
+        summary: 'reroute remediation summary',
+        tasks: assignments.map((assignment) => assignment.task)
+      },
+      assignments,
+      batches: [{ batchId: 'B1', taskIds: ['T1'] }],
+      workerPool: { maxConcurrency: 1 }
+    })
+
+    queue.rerouteTask('T1', 'coder')
+
+    const task = queue.listTasks()[0]?.assignment.task
+    expect(task).toMatchObject({
+      role: 'coder',
+      taskType: 'coding',
+      skills: ['implementation', 'bugfix']
+    })
+  })
+
+  it('slot tmux binding 会透传到 worker snapshot 并在 release/load 后保留', () => {
+    const runDirectory = mkdtempSync(resolve(tmpdir(), 'harness-worker-slot-tmux-'))
+    const assignments = createAssignments(['T1'])
+
+    const queue = createTaskQueue({
+      runDirectory,
+      goal: 'slot tmux goal',
+      plan: {
+        goal: 'slot tmux goal',
+        summary: 'slot tmux summary',
+        tasks: assignments.map((assignment) => assignment.task)
+      },
+      assignments,
+      batches: [{ batchId: 'B1', taskIds: ['T1'] }],
+      workerPool: {
+        maxConcurrency: 1,
+        slotCount: 1,
+        slots: [
+          {
+            slotId: 1,
+            tmux: {
+              paneId: '%12',
+              sessionName: 'tmux-run-a:1',
+              mode: 'dedicated-window',
+              paneIndex: 0,
+              title: 'slot-1'
+            }
+          }
+        ]
+      }
+    })
+
+    expect(queue.getRuntimeSnapshot().workers[0]?.tmux).toMatchObject({
+      paneId: '%12',
+      sessionName: 'tmux-run-a:1'
+    })
+
+    const claim = queue.claimNextTask('W1')
+    expect(claim?.taskId).toBe('T1')
+    queue.releaseTask('T1')
+
+    expect(queue.getRuntimeSnapshot().workers[0]?.tmux).toMatchObject({
+      paneId: '%12',
+      sessionName: 'tmux-run-a:1'
+    })
+
+    const reloaded = loadTaskQueue(runDirectory)
+    expect(reloaded.getRuntimeSnapshot().workers[0]?.tmux).toMatchObject({
+      paneId: '%12',
+      sessionName: 'tmux-run-a:1'
+    })
+  })
+
+  it('slotCount 大于 maxConcurrency 时仍遵守实际并发上限', async () => {
+    const runDirectory = mkdtempSync(resolve(tmpdir(), 'harness-worker-slots-concurrency-'))
+    const assignments = createAssignments(['T1', 'T2', 'T3'])
+    let running = 0
+    let maxSeen = 0
+
+    class SlotAwareConcurrencyAdapter implements CocoAdapter {
+      async execute({ assignment }) {
+        running += 1
+        maxSeen = Math.max(maxSeen, running)
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
+        running -= 1
+
+        return {
+          taskId: assignment.task.id,
+          role: assignment.roleDefinition.name,
+          model: assignment.modelResolution.model,
+          summary: `done ${assignment.task.id}`,
+          status: 'completed' as const,
+          attempt: 1
+        }
+      }
+    }
+
+    const { runtime } = await runAssignmentsWithRuntime({
+      runDirectory,
+      goal: 'slot concurrency goal',
+      plan: {
+        goal: 'slot concurrency goal',
+        summary: 'slot concurrency summary',
+        tasks: assignments.map((assignment) => assignment.task)
+      },
+      assignments,
+      batches: [{ batchId: 'B1', taskIds: ['T1', 'T2', 'T3'] }],
+      adapter: new SlotAwareConcurrencyAdapter(),
+      workerPool: { maxConcurrency: 1, slotCount: 3 }
+    })
+
+    expect(maxSeen).toBe(1)
+    expect(runtime.workers).toHaveLength(3)
+    expect(runtime.workers.map((worker) => worker.slotId)).toEqual([1, 2, 3])
+    expect(runtime.taskStates.map((taskState) => taskState.workerHistory[0])).toEqual(['W1', 'W2', 'W3'])
+  })
+
+  it('appendEvent 会为 runtime event 注入 createdAt 并透传到 event stream', async () => {
+    const runDirectory = mkdtempSync(resolve(tmpdir(), 'harness-event-created-at-'))
+    const assignments = createAssignments(['T1'])
+
+    const queue = createTaskQueue({
+      runDirectory,
+      goal: 'event goal',
+      plan: {
+        goal: 'event goal',
+        summary: 'event summary',
+        tasks: assignments.map((assignment) => assignment.task)
+      },
+      assignments,
+      batches: [{ batchId: 'B1', taskIds: ['T1'] }],
+      workerPool: { maxConcurrency: 1 }
+    })
+
+    queue.appendEvent({
+      type: 'batch-start',
+      batchId: 'B1',
+      detail: 'batch started'
+    })
+
+    const runtimeEvent = queue.getRuntimeSnapshot().events[0]
+    expect(runtimeEvent?.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+
+    const streamedEvents = await readAllRuntimeEvents(runDirectory)
+    expect(streamedEvents[0]?.createdAt).toBe(runtimeEvent?.createdAt)
+  })
+
   it('支持在运行中追加 remediation 任务并更新依赖', () => {
     const runDirectory = mkdtempSync(resolve(tmpdir(), 'harness-task-queue-generated-'))
     const assignments = createAssignments(['T1', 'T2'])
@@ -197,6 +538,13 @@ describe('task queue', () => {
         model: 'gpt5.3-codex',
         source: 'fallback',
         reason: 'test fallback'
+      },
+      executionTarget: {
+        backend: 'coco',
+        model: 'gpt5.3-codex',
+        source: 'fallback',
+        reason: 'test fallback',
+        transport: 'auto'
       }
     }
     assignments[1]!.remediation = {
@@ -210,6 +558,13 @@ describe('task queue', () => {
         model: 'gpt5.3-codex-remediation',
         source: 'remediation',
         reason: 'test remediation'
+      },
+      executionTarget: {
+        backend: 'coco',
+        model: 'gpt5.3-codex-remediation',
+        source: 'remediation',
+        reason: 'test remediation',
+        transport: 'auto'
       },
       taskType: 'coding',
       skills: ['implementation']
@@ -246,6 +601,7 @@ describe('task queue', () => {
         },
         roleDefinition: assignments[1]!.fallback!.roleDefinition,
         modelResolution: assignments[1]!.remediation!.modelResolution,
+        executionTarget: assignments[1]!.remediation!.executionTarget,
         fallback: null,
         remediation: null
       }

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readdirSync, readFileSync } from 'node:fs'
 import { extname, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { dispatchPlan } from '../dispatcher/dispatcher.js'
 import { buildPlan } from '../planner/planner.js'
@@ -20,7 +21,14 @@ import { buildSkillRegistry } from '../team/skill-registry.js'
 import { loadTeamCompositionRegistry } from '../team/team-composition-loader.js'
 import { loadSlashCommandRegistry, resolveSlashCommand } from './slash-command-loader.js'
 import { verifyAssignments, verifyRun } from '../verification/index.js'
-import type { GoalTargetFile } from '../domain/types.js'
+import type {
+  ExecutionBackend,
+  GoalTargetFile,
+  TeamRunSpec,
+  TeamSlotOverride,
+  TeamSlotOverrideKey,
+  TeamSlotSpec
+} from '../domain/types.js'
 
 const { appRoot, repoRoot, stateRoot } = getHarnessRepoPaths()
 const roleModelConfigPath = resolveHarnessConfigPath('role-models.yaml')
@@ -34,7 +42,20 @@ const MAX_TARGET_FILE_CHARS = 4000
 const TARGET_TEXT_FILE_EXTENSIONS = new Set(['.md', '.markdown', '.mdx', '.txt', '.yaml', '.yml', '.json'])
 const IGNORED_TARGET_DIRECTORIES = new Set(['.git', '.harness', 'node_modules', 'dist', 'build', 'coverage'])
 const BOOLEAN_FLAGS = new Set(['attach', 'yolo'])
-const FLAG_ALIASES = new Map<string, string>([['atach', 'attach']])
+const FLAG_ALIASES = new Map<string, string>([
+  ['atach', 'attach'],
+  ['team-size', 'teamSize']
+])
+const TEAM_RUN_DEFAULT_SIZE = 2
+const TEAM_RUN_MAX_SIZE = 32
+const TEAM_RUN_DSL_NAME = 'team-run'
+const TEAM_SLOT_OVERRIDE_KEYS = new Set<TeamSlotOverrideKey>(['backend', 'model', 'profile'])
+const EXECUTION_BACKENDS = new Set<ExecutionBackend>(['coco', 'claude-code', 'local-cc'])
+
+export interface ParsedHarnessTeamInvocation {
+  goal: string
+  teamRunSpec: TeamRunSpec
+}
 
 function appendFlag(flags: Map<string, string>, key: string, value: string) {
   const normalizedKey = FLAG_ALIASES.get(key) ?? key
@@ -47,12 +68,21 @@ function appendFlag(flags: Map<string, string>, key: string, value: string) {
   flags.set(normalizedKey, value)
 }
 
-function parseFlags(args: string[]): { flags: Map<string, string>; positionals: string[] } {
+function parseFlags(args: string[], options?: { preserveSeparator?: boolean }): { flags: Map<string, string>; positionals: string[] } {
   const flags = new Map<string, string>()
   const positionals: string[] = []
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!
+    if (arg === '--') {
+      if (options?.preserveSeparator) {
+        positionals.push(arg, ...args.slice(index + 1))
+      } else {
+        positionals.push(...args.slice(index + 1))
+      }
+      break
+    }
+
     const prefix = arg.startsWith('--') ? '--' : arg.startsWith('-') && arg.length > 1 ? '-' : ''
 
     if (prefix) {
@@ -97,6 +127,148 @@ function normalizeCommandInvocation(command: string, flags: Map<string, string>,
   }
 
   return { flags: normalizedFlags, positionals: normalizedPositionals }
+}
+
+function isPositiveIntegerToken(value: string): boolean {
+  return /^\d+$/.test(value) && Number(value) > 0
+}
+
+function parseTeamSlotOverrideToken(token: string): TeamSlotOverride | null {
+  const match = token.match(/^(\d+):([a-z-]+)=(.*)$/)
+  if (!match) {
+    return null
+  }
+
+  const [, slotIdToken, rawKey, rawValue] = match
+  const slotId = Number(slotIdToken)
+  if (!Number.isInteger(slotId) || slotId <= 0) {
+    throw new Error(`slotId 非法: ${slotIdToken}`)
+  }
+
+  if (!TEAM_SLOT_OVERRIDE_KEYS.has(rawKey as TeamSlotOverrideKey)) {
+    throw new Error(`slot override key 非法: ${rawKey}（可选: backend, model, profile）`)
+  }
+
+  const value = rawValue.trim()
+  if (!value) {
+    throw new Error(`slot override 值不能为空: ${token}`)
+  }
+
+  const key = rawKey as TeamSlotOverrideKey
+  if (key === 'backend' && !EXECUTION_BACKENDS.has(value as ExecutionBackend)) {
+    throw new Error(`backend 非法: ${value}（可选: coco, claude-code, local-cc）`)
+  }
+
+  return {
+    slotId,
+    key,
+    value
+  }
+}
+
+function buildTeamSlotSpecs(teamSize: number, overrides: TeamSlotOverride[]): TeamSlotSpec[] {
+  const slots: TeamSlotSpec[] = Array.from({ length: teamSize }, (_, index) => ({
+    slotId: index + 1
+  }))
+
+  for (const override of overrides) {
+    if (override.slotId > teamSize) {
+      throw new Error(`slot ${override.slotId} 超出 team-size=${teamSize}`)
+    }
+
+    const slot = slots[override.slotId - 1]!
+    if (override.key === 'backend') {
+      slot.backend = override.value as ExecutionBackend
+    }
+    if (override.key === 'model') {
+      slot.model = override.value
+    }
+    if (override.key === 'profile') {
+      slot.profile = override.value
+    }
+  }
+
+  return slots
+}
+
+function shouldTreatFirstTokenAsExplicitTeamSize(positionals: string[]): boolean {
+  if (!isPositiveIntegerToken(positionals[0] ?? null)) {
+    return false
+  }
+
+  const secondToken = positionals[1]
+  if (secondToken === '--') {
+    return true
+  }
+
+  return secondToken != null && parseTeamSlotOverrideToken(secondToken) != null
+}
+
+function validateTeamSize(teamSize: number): void {
+  if (!Number.isInteger(teamSize) || teamSize <= 0) {
+    throw new Error(`team-size 非法: ${teamSize}`)
+  }
+  if (teamSize > TEAM_RUN_MAX_SIZE) {
+    throw new Error(`team-size 超出上限: ${teamSize}（最大 ${TEAM_RUN_MAX_SIZE}）`)
+  }
+}
+
+function applyExplicitTeamSize(parsed: ParsedHarnessTeamInvocation, explicitTeamSize: number): ParsedHarnessTeamInvocation {
+  validateTeamSize(explicitTeamSize)
+  return {
+    ...parsed,
+    teamRunSpec: {
+      teamSize: explicitTeamSize,
+      overrides: parsed.teamRunSpec.overrides,
+      slots: buildTeamSlotSpecs(explicitTeamSize, parsed.teamRunSpec.overrides)
+    }
+  }
+}
+
+export function parseHarnessTeamInvocation(positionals: string[]): ParsedHarnessTeamInvocation {
+  if (positionals.length === 0) {
+    throw new Error('`/harness-team` 需要提供 goal，格式: /harness-team [team-size --] [slotId:key=value ...] "goal" 或 /harness-team --team-size N "goal"')
+  }
+
+  let cursor = 0
+  let explicitTeamSize: number | null = null
+  if (positionals[cursor] === '--') {
+    cursor += 1
+  } else if (shouldTreatFirstTokenAsExplicitTeamSize(positionals)) {
+    explicitTeamSize = Number(positionals[0])
+    cursor += 1
+    if (positionals[cursor] === '--') {
+      cursor += 1
+    }
+  }
+
+  const overrides: TeamSlotOverride[] = []
+  while (cursor < positionals.length) {
+    const override = parseTeamSlotOverrideToken(positionals[cursor]!)
+    if (!override) {
+      break
+    }
+    overrides.push(override)
+    cursor += 1
+  }
+
+  const goal = positionals.slice(cursor).join(' ').trim()
+  if (!goal) {
+    throw new Error('`/harness-team` 需要提供 goal，格式: /harness-team [team-size --] [slotId:key=value ...] "goal" 或 /harness-team --team-size N "goal"')
+  }
+
+  const maxSlotId = overrides.reduce((currentMax, override) => Math.max(currentMax, override.slotId), 0)
+  const teamSize = explicitTeamSize ?? Math.max(TEAM_RUN_DEFAULT_SIZE, maxSlotId)
+  validateTeamSize(teamSize)
+
+  return {
+    goal,
+    teamRunSpec: {
+      teamSize,
+      overrides,
+      slots: buildTeamSlotSpecs(teamSize, overrides)
+    }
+  }
 }
 
 function normalizeTargetContent(raw: string): string {
@@ -299,15 +471,31 @@ function createAdapter(params: {
   throw new Error(`adapter 非法: ${adapterKind}（可选: coco-auto, coco-cli, coco-pty, dry-run）`)
 }
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const [, , rawCommand = 'plan', ...rawArgs] = process.argv
-  const { flags: parsedFlags, positionals } = parseFlags(rawArgs)
+  const { flags: parsedFlags, positionals } = parseFlags(rawArgs, { preserveSeparator: rawCommand === '/harness-team' })
   const slashCommandRegistry = loadSlashCommandRegistry(slashCommandConfigPath)
   const slashResolution = resolveSlashCommand(rawCommand, parsedFlags, slashCommandRegistry)
   const command = slashResolution?.command ?? rawCommand
   const normalizedInvocation = normalizeCommandInvocation(command, slashResolution?.flags ?? parsedFlags, positionals)
   const flags = normalizedInvocation.flags
-  const goal = normalizedInvocation.positionals.join(' ').trim()
+  const isTeamRunDsl = slashResolution?.dsl === TEAM_RUN_DSL_NAME || rawCommand === '/harness-team'
+  const baseParsedHarnessTeam = isTeamRunDsl ? parseHarnessTeamInvocation(normalizedInvocation.positionals) : null
+  const explicitTeamSizeFlag = flags.get('teamSize')
+  if (explicitTeamSizeFlag && (!Number.isInteger(Number(explicitTeamSizeFlag)) || Number(explicitTeamSizeFlag) <= 0)) {
+    throw new Error(`team-size 非法: ${explicitTeamSizeFlag}`)
+  }
+  const parsedHarnessTeam = baseParsedHarnessTeam && explicitTeamSizeFlag
+    ? applyExplicitTeamSize(baseParsedHarnessTeam, Number(explicitTeamSizeFlag))
+    : baseParsedHarnessTeam
+  const goal = parsedHarnessTeam?.goal ?? normalizedInvocation.positionals.join(' ').trim()
+
+  if (parsedHarnessTeam && parsedHarnessTeam.teamRunSpec.overrides.length > 0) {
+    process.stderr.write(
+      '[harness] slot overrides 已接入 teamRunSpec，并会在 worker slot 与执行目标解析中生效\n'
+    )
+  }
+
   const targetFlag = flags.get('target')
   const dirFlag = flags.get('dir')
   const targetFiles = mergeTargetFiles(targetFlag ? readTargetFiles(targetFlag) : [], dirFlag ? readTargetDirectories(dirFlag) : [])
@@ -358,11 +546,11 @@ async function main(): Promise<void> {
     throw new Error(`maxConcurrency 非法: ${maxConcurrencyFlag}`)
   }
 
-  const maxConcurrency = maxConcurrencyFlag ? Number(maxConcurrencyFlag) : undefined
+  const maxConcurrency = maxConcurrencyFlag ? Number(maxConcurrencyFlag) : parsedHarnessTeam?.teamRunSpec.teamSize
 
   if (command === 'plan') {
     const plan = applyFailurePolicies(
-      buildPlan({ goal: effectiveGoal, teamName, compositionName, targetFiles }, teamCompositionRegistry),
+      buildPlan({ goal: effectiveGoal, teamName, compositionName, teamRunSpec: parsedHarnessTeam?.teamRunSpec, targetFiles }, teamCompositionRegistry),
       failurePolicyConfig
     )
     const assignments = dispatchPlan(plan, roleRegistry, modelConfig, teamName)
@@ -390,7 +578,7 @@ async function main(): Promise<void> {
       workspaceRoot: repoRoot,
       stateRoot,
       runDirectory,
-      input: { goal: effectiveGoal, teamName, compositionName, targetFiles },
+      input: { goal: effectiveGoal, teamName, compositionName, teamRunSpec: parsedHarnessTeam?.teamRunSpec, targetFiles },
       adapter,
       roleRegistry,
       modelConfig,
@@ -489,8 +677,12 @@ async function main(): Promise<void> {
   throw new Error(`未知命令: ${command}`)
 }
 
-main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error)
-  process.stderr.write(`${message}\n`)
-  process.exitCode = 1
-})
+const isDirectExecution = process.argv[1] ? import.meta.url === pathToFileURL(process.argv[1]).href : false
+
+if (isDirectExecution) {
+  main().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error)
+    process.stderr.write(`${message}\n`)
+    process.exitCode = 1
+  })
+}

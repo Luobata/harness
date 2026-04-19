@@ -881,6 +881,6 @@ describe('watch command', () => {
     expect(result.stderr).toBe('')
     expect(result.stdout).toContain('Status: COMPLETED')
     expect(result.stdout).toContain('Workers')
-    expect(result.stdout).toContain('Recent Events')
+    expect(result.stdout).toContain('Team Activity')
   })
 })

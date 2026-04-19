@@ -87,7 +87,11 @@ function renderTaskOverviewSection(view: NonNullable<WatchViewModel['selectedTas
     formatDetailLine('Last Error', formatNullable(lastError)),
     formatDetailLine('Summary', formatNullable(view.summary)),
     formatDetailLine('Depends On', view.dependsOn.length > 0 ? view.dependsOn.join(', ') : PLACEHOLDER),
-    formatDetailLine('Generated From', formatNullable(view.generatedFromTaskId))
+    formatDetailLine('Generated From', formatNullable(view.generatedFromTaskId)),
+    formatDetailLine('Worker', formatNullable(view.execution?.workerId ?? null)),
+    formatDetailLine('Slot', view.execution?.slotId != null ? String(view.execution.slotId) : PLACEHOLDER),
+    formatDetailLine('Pane', formatNullable(view.execution?.paneId ?? null)),
+    formatDetailLine('Tmux Session', formatNullable(view.execution?.tmuxSessionLabel ?? null))
   ]
 }
 
@@ -203,7 +207,8 @@ function renderSummary(view: WatchViewModel): string[] {
     `Run: ${summary.runLabel}    Status: ${summary.overallStatus}    Batch: ${summary.batchProgress}`,
     `Goal: ${summary.goal}`,
     `Tasks: total=${summary.totalTaskCount} completed=${summary.completedTaskCount} failed=${summary.failedTaskCount} blocked=${summary.blockedTaskCount} in_progress=${summary.inProgressTaskCount} ready=${summary.readyTaskCount} pending=${summary.pendingTaskCount}`,
-    `Loops: generated=${summary.generatedTaskCount} retry=${summary.retryTaskCount} loop=${summary.loopCount} maxConcurrency=${summary.maxConcurrency}`
+    `Loops: generated=${summary.generatedTaskCount} retry=${summary.retryTaskCount} loop=${summary.loopCount} maxConcurrency=${summary.maxConcurrency}`,
+    `Tmux: ${formatNullable(summary.tmuxSessionLabel)}`
   ]
 }
 
@@ -232,7 +237,7 @@ function renderWorkers(view: WatchViewModel, focusedPane: WatchPane): string[] {
   return [
     renderHeader('Workers', WORKERS_WIDTH, focusedPane === 'workers'),
     ...view.workers.map((worker) => {
-      return `${pad(worker.workerId, 4)} ${pad(worker.roleLabel, 12)} ${pad(worker.status, 10)} ${pad(worker.taskId ?? PLACEHOLDER, 8)} ${truncate(worker.taskTitle, 28)}`
+      return `${pad(worker.scopeLabel, 12)} ${pad(worker.roleLabel, 12)} ${pad(worker.status, 10)} ${pad(worker.taskId ?? PLACEHOLDER, 8)} ${truncate(worker.taskTitle, 20)}`
     })
   ]
 }
@@ -365,9 +370,10 @@ function renderColumns(columns: Array<{ lines: string[]; width: number }>): stri
 
 function renderRecentEvents(view: WatchViewModel, focusedPane: WatchPane): string[] {
   return [
-    formatPaneTitle('Recent Events', focusedPane === 'events'),
+    formatPaneTitle('Team Activity', focusedPane === 'events'),
     ...view.recentEvents.map((event) => {
-      return `${pad(event.type, 16)} ${pad(event.batchId, 8)} ${pad(event.taskId ?? PLACEHOLDER, 10)} ${truncate(event.detail, RECENT_EVENT_DETAIL_WIDTH)}`
+      const scopeLabel = event.source === 'mailbox' ? event.workerId ?? PLACEHOLDER : event.batchId ?? PLACEHOLDER
+      return `${pad(formatNullable(event.createdAt), 20)} ${pad(event.source, 7)} ${pad(event.type, 18)} ${pad(scopeLabel, 8)} ${pad(event.taskId ?? PLACEHOLDER, 10)} ${truncate(event.detail, RECENT_EVENT_DETAIL_WIDTH)}`
     })
   ]
 }
