@@ -195,6 +195,8 @@ describe('runGoal', () => {
     expect(report.runtime.loopSummaries.find((summary) => summary.sourceTaskId === 'T4')?.generatedTaskIds).toContain('T4_FIX_1')
     expect(report.results.find((result) => result.taskId === 'T4_FIX_1')?.role).toBe('coder')
     expect(report.results.find((result) => result.taskId === 'T4_FIX_1')?.model).toBe('gpt5.3-codex-remediation')
+    expect(report.results.find((result) => result.taskId === 'T4_FIX_1')?.backend).toBe('coco')
+    expect(report.results.find((result) => result.taskId === 'T4_FIX_1')?.transport).toBe('auto')
     expect(report.runtime.taskStates.find((taskState) => taskState.taskId === 'T4')?.attempts).toBe(2)
     expect(report.runtime.taskStates.find((taskState) => taskState.taskId === 'T4')?.status).toBe('completed')
     expect(report.summary.generatedTaskCount).toBe(1)

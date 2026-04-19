@@ -32,6 +32,7 @@ export type WatchSummaryViewModel = {
   goal: string
   overallStatus: 'RUNNING' | 'FAILED' | 'COMPLETED'
   batchProgress: string
+  tmuxSessionLabel: string | null
   totalTaskCount: number
   completedTaskCount: number
   failedTaskCount: number
@@ -48,12 +49,15 @@ export type WatchSummaryViewModel = {
 
 export type WatchWorkerViewModel = {
   workerId: string
+  scopeLabel: string
   status: WorkerSnapshot['status']
   roleLabel: string
   taskId: string | null
   taskTitle: string
   modelLabel: string
   heartbeatLabel: string
+  paneLabel: string
+  tmuxSessionLabel: string
   isPlaceholder: boolean
 }
 
@@ -74,8 +78,11 @@ export type WatchHotTaskViewModel = {
 }
 
 export type WatchRecentEventViewModel = {
-  type: RunReport['runtime']['events'][number]['type']
-  batchId: string
+  source: 'event' | 'mailbox'
+  type: string
+  createdAt: string | null
+  workerId: string | null
+  batchId: string | null
   taskId: string | null
   detail: string
 }
@@ -94,9 +101,17 @@ export type WatchSelectedTaskViewModel = {
   summary: string | null
   dependsOn: string[]
   generatedFromTaskId: string | null
+  execution: WatchTaskExecutionViewModel | null
   failureDetail: WatchFailureDetailViewModel | null
   collaboration: WatchTaskCollaborationViewModel
   artifacts: WatchTaskArtifactsViewModel
+}
+
+export type WatchTaskExecutionViewModel = {
+  workerId: string
+  slotId: number | null
+  paneId: string | null
+  tmuxSessionLabel: string | null
 }
 
 export type WatchTaskArtifactsViewModel = {
@@ -211,6 +226,20 @@ function formatNullable(value: string | null | undefined): string {
   return value && value.trim() ? value : PLACEHOLDER
 }
 
+function formatWorkerScopeLabel(worker: Pick<WorkerSnapshot, 'workerId' | 'slotId' | 'tmux'> | null | undefined): string {
+  if (!worker) {
+    return PLACEHOLDER
+  }
+
+  return [worker.workerId, worker.slotId ? `S${worker.slotId}` : null, worker.tmux?.paneId ?? null]
+    .filter((part): part is string => Boolean(part))
+    .join('/')
+}
+
+function resolveTmuxSessionLabel(workers: WorkerSnapshot[]): string | null {
+  return workers.find((worker) => worker.tmux?.sessionName)?.tmux?.sessionName ?? null
+}
+
 function normalizePositiveInteger(value: number | undefined, fallback: number): number {
   return Number.isInteger(value) && value! > 0 ? value! : fallback
 }
@@ -265,6 +294,21 @@ function getHotTaskRank(status: RuntimeTaskState['status']): number {
     default:
       return 5
   }
+}
+
+function getRecentActivityTimestamp(createdAt: string | null | undefined): number {
+  return createdAt ? Date.parse(createdAt) || 0 : 0
+}
+
+function resolveEventCreatedAt(
+  event: RunReport['runtime']['events'][number],
+  taskMetadataById: Map<string, TaskMetadata>
+): string | null {
+  if (event.createdAt) {
+    return event.createdAt
+  }
+
+  return event.taskId ? taskMetadataById.get(event.taskId)?.state.lastUpdatedAt ?? null : null
 }
 
 function buildReportFromQueue(runDirectory: string): RunReport {
@@ -495,6 +539,21 @@ function buildSelectedTaskFailureDetailViewModel(
   }
 }
 
+function buildSelectedTaskExecutionViewModel(report: RunReport, entry: TaskMetadata): WatchTaskExecutionViewModel | null {
+  const workerId = entry.state.claimedBy ?? entry.state.workerHistory.at(-1) ?? null
+  if (!workerId) {
+    return null
+  }
+
+  const worker = report.runtime.workers.find((candidate) => candidate.workerId === workerId)
+  return {
+    workerId,
+    slotId: worker?.slotId ?? null,
+    paneId: worker?.tmux?.paneId ?? null,
+    tmuxSessionLabel: worker?.tmux?.sessionName ?? null
+  }
+}
+
 function toSelectedTaskViewModel(
   report: RunReport,
   entry: TaskMetadata,
@@ -514,6 +573,7 @@ function toSelectedTaskViewModel(
     summary: entry.summary,
     dependsOn: entry.task.dependsOn,
     generatedFromTaskId: entry.task.generatedFromTaskId ?? null,
+    execution: buildSelectedTaskExecutionViewModel(report, entry),
     failureDetail: buildSelectedTaskFailureDetailViewModel(report, entry, taskMetadataById),
     collaboration: buildSelectedTaskCollaborationViewModel(report, entry, taskMetadataById),
     artifacts: buildSelectedTaskArtifactsViewModel(entry)
@@ -553,20 +613,24 @@ export function buildWatchViewModel(report: RunReport, resolvedRun: WatchResolve
       : statusCounts.failed > 0 || statusCounts.blocked > 0
         ? 'FAILED'
         : 'COMPLETED'
+  const tmuxSessionLabel = resolveTmuxSessionLabel(report.runtime.workers)
 
-  const workers = Array.from({ length: Math.max(report.runtime.maxConcurrency, 1) }, (_, index) => {
+  const workers = Array.from({ length: Math.max(report.runtime.workers.length, report.runtime.maxConcurrency, 1) }, (_, index) => {
     const workerId = `W${index + 1}`
     const worker = report.runtime.workers.find((candidate) => candidate.workerId === workerId)
     const task = worker?.taskId ? taskById.get(worker.taskId) : null
 
     return {
       workerId,
+      scopeLabel: worker ? formatWorkerScopeLabel(worker) : workerId,
       status: worker?.status ?? 'idle',
       roleLabel: formatNullable(worker?.role),
       taskId: worker?.taskId ?? null,
       taskTitle: formatNullable(task?.title),
       modelLabel: formatNullable(worker?.model),
       heartbeatLabel: formatNullable(worker?.lastHeartbeatAt),
+      paneLabel: formatNullable(worker?.tmux?.paneId ?? null),
+      tmuxSessionLabel: formatNullable(worker?.tmux?.sessionName ?? null),
       isPlaceholder: !worker
     } satisfies WatchWorkerViewModel
   })
@@ -614,15 +678,35 @@ export function buildWatchViewModel(report: RunReport, resolvedRun: WatchResolve
     ? toSelectedTaskViewModel(report, taskMetadataById.get(selectedTaskEntry.task.id)!, taskMetadataById)
     : null
 
-  const recentEvents = report.runtime.events
-    .slice(-recentEventLimit)
-    .reverse()
-    .map((event) => ({
+  const recentEvents = [
+    ...report.runtime.events.map((event) => ({
+      source: 'event' as const,
       type: event.type,
+      createdAt: resolveEventCreatedAt(event, taskMetadataById),
+      workerId: null,
       batchId: event.batchId,
       taskId: event.taskId ?? null,
       detail: event.detail
+    })),
+    ...report.runtime.mailbox.map((message) => ({
+      source: 'mailbox' as const,
+      type: `mailbox:${message.direction}`,
+      createdAt: message.createdAt,
+      workerId: message.workerId,
+      batchId: null,
+      taskId: message.taskId,
+      detail: message.content
     }))
+  ]
+    .sort((left, right) => {
+      const timeDiff = getRecentActivityTimestamp(right.createdAt) - getRecentActivityTimestamp(left.createdAt)
+      if (timeDiff !== 0) {
+        return timeDiff
+      }
+
+      return right.type.localeCompare(left.type, 'zh-Hans-CN')
+    })
+    .slice(0, recentEventLimit)
 
   return {
     resolvedRun,
@@ -631,6 +715,7 @@ export function buildWatchViewModel(report: RunReport, resolvedRun: WatchResolve
       goal: report.goal,
       overallStatus,
       batchProgress: `${settledBatchCount}/${batchCount}`,
+      tmuxSessionLabel,
       totalTaskCount: report.plan.tasks.length,
       completedTaskCount: statusCounts.completed,
       failedTaskCount: statusCounts.failed,

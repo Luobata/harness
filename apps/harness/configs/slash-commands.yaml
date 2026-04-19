@@ -32,3 +32,7 @@ commands:
     action: run
     composition: mixed-research-dev
     description: 调研加开发的完整闭环
+  harness-team:
+    action: run
+    dsl: team-run
+    description: 在对话中展开 team mode，并支持 slot 覆写

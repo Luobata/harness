@@ -75,6 +75,7 @@ function buildRemediationAssignment(baseAssignment: DispatchAssignment, attempt:
     },
     roleDefinition: remediation.roleDefinition,
     modelResolution: remediation.modelResolution,
+    executionTarget: remediation.executionTarget,
     fallback: null,
     remediation: null
   }
@@ -120,6 +121,12 @@ function createMailboxMessage(
   }
 }
 
+function formatWorkerScope(queue: PersistentTaskQueue, workerId: string): string {
+  const worker = queue.getWorker(workerId)
+  const scopeParts = [workerId, worker.slotId ? `S${worker.slotId}` : null, worker.tmux?.paneId ?? null]
+  return scopeParts.filter((part): part is string => Boolean(part)).join('/')
+}
+
 async function executeClaim(params: {
   queue: PersistentTaskQueue
   claim: QueueClaimResult
@@ -129,12 +136,13 @@ async function executeClaim(params: {
   const { queue, claim, adapter, workspaceRoot } = params
   const { assignment, batchId, maxAttempts, taskId, workerId } = claim
   const artifactSnapshotBefore = captureTaskArtifactSnapshot(workspaceRoot)
+  const workerScope = formatWorkerScope(queue, workerId)
 
   queue.appendTaskEvent(taskId, {
     type: 'task-claimed',
     batchId,
     taskId,
-    detail: `${workerId} claim ${taskId} (attempt ${claim.attempt}/${maxAttempts})`
+    detail: `${workerScope} claim ${taskId} (attempt ${claim.attempt}/${maxAttempts})`
   })
   queue.appendMailboxMessage(
     createMailboxMessage(queue, {
@@ -148,14 +156,24 @@ async function executeClaim(params: {
     type: 'task-start',
     batchId,
     taskId,
-    detail: `${workerId} 开始执行 ${taskId}`
+    detail: `${workerScope} 开始执行 ${taskId}`
   })
 
   try {
     const dependencyResults = queue.getDependencyTaskContexts(taskId)
     const result = await adapter.execute({ assignment, dependencyResults } satisfies CocoExecutionRequest)
     const finishedAt = now()
-    const finalResult: TaskExecutionResult = { ...result, attempt: claim.attempt }
+    const slotId = queue.getWorker(workerId).slotId
+    const finalResult: TaskExecutionResult = {
+      ...result,
+      model: assignment.executionTarget.model,
+      backend: assignment.executionTarget.backend,
+      command: assignment.executionTarget.command ?? null,
+      transport: assignment.executionTarget.transport,
+      profile: assignment.executionTarget.profile ?? null,
+      slotId,
+      attempt: claim.attempt
+    }
 
     if (finalResult.status !== 'completed') {
       throw new Error(finalResult.summary)
@@ -183,14 +201,14 @@ async function executeClaim(params: {
       type: 'task-complete',
       batchId,
       taskId,
-      detail: `${workerId} 完成 ${taskId}`
+      detail: `${workerScope} 完成 ${taskId}`
     })
     queue.releaseTask(taskId)
     queue.appendTaskEvent(taskId, {
       type: 'task-released',
       batchId,
       taskId,
-      detail: `${workerId} release ${taskId}`
+      detail: `${workerScope} release ${taskId}`
     })
   } catch (error) {
     const failedAt = now()
@@ -211,7 +229,12 @@ async function executeClaim(params: {
         : {
             taskId,
             role: assignment.roleDefinition.name,
-            model: assignment.modelResolution.model,
+            model: assignment.executionTarget.model,
+            backend: assignment.executionTarget.backend,
+            command: assignment.executionTarget.command ?? null,
+            transport: assignment.executionTarget.transport,
+            profile: assignment.executionTarget.profile ?? null,
+            slotId: queue.getWorker(workerId).slotId,
             status: 'failed',
             summary: message,
             attempt: claim.attempt
@@ -222,7 +245,7 @@ async function executeClaim(params: {
       type: 'task-failed',
       batchId,
       taskId,
-      detail: `${workerId} 执行 ${taskId} 失败: ${message}`
+      detail: `${workerScope} 执行 ${taskId} 失败: ${message}`
     })
     queue.appendMailboxMessage(
       createMailboxMessage(queue, {
@@ -267,7 +290,7 @@ async function executeClaim(params: {
       type: 'task-released',
       batchId,
       taskId,
-      detail: `${workerId} release ${taskId} (failed)`
+      detail: `${workerScope} release ${taskId} (failed)`
     })
   } finally {
     queue.updateTaskArtifacts(taskId, buildTaskArtifacts(taskId, artifactSnapshotBefore, captureTaskArtifactSnapshot(workspaceRoot)))
@@ -278,7 +301,19 @@ function claimBatchTasks(queue: PersistentTaskQueue, batch: ExecutionBatch): Que
   const runtime = queue.getRuntimeSnapshot()
   const claims: QueueClaimResult[] = []
 
-  for (const worker of runtime.workers.filter((candidate) => candidate.status === 'idle')) {
+  const idleWorkers = [...runtime.workers]
+    .filter((candidate) => candidate.status === 'idle')
+    .sort((left, right) => {
+      const leftTimestamp = left.lastHeartbeatAt ? Date.parse(left.lastHeartbeatAt) || 0 : Number.NEGATIVE_INFINITY
+      const rightTimestamp = right.lastHeartbeatAt ? Date.parse(right.lastHeartbeatAt) || 0 : Number.NEGATIVE_INFINITY
+      if (leftTimestamp !== rightTimestamp) {
+        return leftTimestamp - rightTimestamp
+      }
+
+      return (left.slotId ?? Number.MAX_SAFE_INTEGER) - (right.slotId ?? Number.MAX_SAFE_INTEGER)
+    })
+
+  for (const worker of idleWorkers.slice(0, runtime.maxConcurrency)) {
     const claim = queue.claimNextTask(worker.workerId, { allowedTaskIds: batch.taskIds })
     if (!claim) {
       continue

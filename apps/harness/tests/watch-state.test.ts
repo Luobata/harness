@@ -40,6 +40,13 @@ function createAssignment(task: Task): DispatchAssignment {
       source: 'role',
       reason: 'test'
     },
+    executionTarget: {
+      backend: 'coco',
+      model: `${task.role}-model`,
+      source: 'role',
+      reason: 'test',
+      transport: 'auto'
+    },
     roleDefinition: {
       name: task.role,
       description: `${task.role} role`,
@@ -99,6 +106,14 @@ function createReport(goal: string): RunReport {
       workers: [
         {
           workerId: 'W1',
+          slotId: 1,
+          tmux: {
+            paneId: '%12',
+            sessionName: 'tmux-run-a:1',
+            mode: 'dedicated-window',
+            paneIndex: 0,
+            title: 'slot-1'
+          },
           role: 'coder',
           taskId: 'T2',
           model: 'coder-model',
@@ -107,6 +122,14 @@ function createReport(goal: string): RunReport {
         },
         {
           workerId: 'W2',
+          slotId: 2,
+          tmux: {
+            paneId: '%13',
+            sessionName: 'tmux-run-a:1',
+            mode: 'dedicated-window',
+            paneIndex: 1,
+            title: 'slot-2'
+          },
           role: null,
           taskId: null,
           model: null,
@@ -127,11 +150,11 @@ function createReport(goal: string): RunReport {
       },
       loopSummaries: [],
       events: [
-        { type: 'batch-start', batchId: 'B1', detail: 'batch started' },
-        { type: 'task-start', batchId: 'B1', taskId: 'T2', detail: 'task started' },
-        { type: 'task-failed', batchId: 'B1', taskId: 'T1', detail: 'task failed' },
-        { type: 'task-complete', batchId: 'B1', taskId: 'T4', detail: 'task completed' },
-        { type: 'task-generated', batchId: 'B1', taskId: 'T4_FIX_1', detail: 'generated remediation task' }
+        { type: 'batch-start', batchId: 'B1', detail: 'batch started', createdAt: '2026-04-12T10:00:00.000Z' },
+        { type: 'task-start', batchId: 'B1', taskId: 'T2', detail: 'task started', createdAt: '2026-04-12T10:04:00.000Z' },
+        { type: 'task-failed', batchId: 'B1', taskId: 'T1', detail: 'task failed', createdAt: '2026-04-12T10:03:00.000Z' },
+        { type: 'task-complete', batchId: 'B1', taskId: 'T4', detail: 'task completed', createdAt: '2026-04-12T10:05:00.000Z' },
+        { type: 'task-generated', batchId: 'B1', taskId: 'T4_FIX_1', detail: 'generated remediation task', createdAt: '2026-04-12T10:05:30.000Z' }
       ],
       mailbox: [],
       taskStates: [
@@ -377,6 +400,7 @@ describe('watch state', () => {
       goal: 'watch latest goal',
       overallStatus: 'RUNNING',
       batchProgress: '0/1',
+      tmuxSessionLabel: 'tmux-run-a:1',
       totalTaskCount: 6,
       completedTaskCount: 2,
       failedTaskCount: 1,
@@ -391,45 +415,116 @@ describe('watch state', () => {
     expect(viewModel.workers).toHaveLength(3)
     expect(viewModel.workers[0]).toMatchObject({
       workerId: 'W1',
+      scopeLabel: 'W1/S1/%12',
       roleLabel: 'coder',
       taskId: 'T2',
       taskTitle: 'Implement feature',
       modelLabel: 'coder-model',
       heartbeatLabel: '2026-04-12T10:04:00.000Z',
+      paneLabel: '%12',
+      tmuxSessionLabel: 'tmux-run-a:1',
       isPlaceholder: false
     })
     expect(viewModel.workers[1]).toMatchObject({
       workerId: 'W2',
+      scopeLabel: 'W2/S2/%13',
       roleLabel: '--',
       taskTitle: '--',
       modelLabel: '--',
       heartbeatLabel: '--',
+      paneLabel: '%13',
+      tmuxSessionLabel: 'tmux-run-a:1',
       isPlaceholder: false
     })
     expect(viewModel.workers[2]).toMatchObject({
       workerId: 'W3',
+      scopeLabel: 'W3',
       roleLabel: '--',
       taskTitle: '--',
       modelLabel: '--',
       heartbeatLabel: '--',
+      paneLabel: '--',
+      tmuxSessionLabel: '--',
       isPlaceholder: true
     })
     expect(viewModel.recentEvents).toHaveLength(3)
-    expect(viewModel.recentEvents.map((event) => event.type)).toEqual(['task-generated', 'task-complete', 'task-failed'])
+    expect(viewModel.recentEvents.map((event) => event.type)).toEqual(['task-generated', 'task-complete', 'task-start'])
+    expect(viewModel.recentEvents.map((event) => event.createdAt)).toEqual([
+      '2026-04-12T10:05:30.000Z',
+      '2026-04-12T10:05:00.000Z',
+      '2026-04-12T10:04:00.000Z'
+    ])
 
     const rendered = renderWatchScreen(viewModel)
     expect(rendered).toContain('Workers')
     expect(rendered).toContain('Hot Tasks')
     expect(rendered).toContain('Task Details')
-    expect(rendered).toContain('Recent Events')
+    expect(rendered).toContain('Team Activity')
     expect(rendered).toContain('Status: RUNNING')
     expect(rendered).toContain('>')
-    expect(rendered).toContain('W1   coder        running    T2       Implement feature')
+    expect(rendered).toContain('W1/S1/%12')
+    expect(rendered).toContain('Pane: %12')
     expect(rendered).toContain('> T1       coding       failed')
     expect(rendered).toContain('Task ID:')
     expect(rendered).toContain('Last Error:')
     expect(rendered).toContain('Depends On:')
     expect(rendered).toContain('[↑/k] prev  [↓/j] next')
+  })
+
+  it('recentEvents 会按 createdAt 合并 runtime events 与 mailbox 活动流', () => {
+    const stateRoot = mkdtempSync(resolve(tmpdir(), 'harness-watch-state-activity-'))
+    const report = createReport('activity goal')
+    report.runtime.mailbox = [
+      createMailboxMessage('M1', 'T2', 'outbound', 'implemented handoff notes', '2026-04-12T10:04:45.000Z', 'W1'),
+      createMailboxMessage('M2', 'T4', 'inbound', 'claim task T4', '2026-04-12T10:05:15.000Z', 'W2')
+    ]
+    persistRunReport(stateRoot, report, resolve(stateRoot, 'runs', 'run-activity'))
+
+    const viewModel = loadWatchViewModel({ stateRoot, recentEventLimit: 4 })
+
+    expect(viewModel.recentEvents.map((event) => ({ source: event.source, type: event.type, taskId: event.taskId }))).toEqual([
+      { source: 'event', type: 'task-generated', taskId: 'T4_FIX_1' },
+      { source: 'mailbox', type: 'mailbox:inbound', taskId: 'T4' },
+      { source: 'event', type: 'task-complete', taskId: 'T4' },
+      { source: 'mailbox', type: 'mailbox:outbound', taskId: 'T2' }
+    ])
+
+    const rendered = renderWatchScreen(viewModel)
+    expect(rendered).toContain('Team Activity')
+    expect(rendered).toContain('mailbox:inbound')
+    expect(rendered).toContain('implemented handoff notes')
+  })
+
+  it('slotCount 大于 maxConcurrency 时 Workers 仍展示完整 slot/pane 池', () => {
+    const stateRoot = mkdtempSync(resolve(tmpdir(), 'harness-watch-state-slots-'))
+    const report = createReport('slot visibility goal')
+    report.runtime.maxConcurrency = 1
+    report.runtime.workers = [
+      report.runtime.workers[0]!,
+      report.runtime.workers[1]!,
+      {
+        workerId: 'W3',
+        slotId: 3,
+        tmux: {
+          paneId: '%14',
+          sessionName: 'tmux-run-a:1',
+          mode: 'dedicated-window',
+          paneIndex: 2,
+          title: 'slot-3'
+        },
+        role: null,
+        taskId: null,
+        model: null,
+        status: 'idle',
+        lastHeartbeatAt: null
+      }
+    ]
+    persistRunReport(stateRoot, report, resolve(stateRoot, 'runs', 'run-slot-visibility'))
+
+    const viewModel = loadWatchViewModel({ stateRoot })
+
+    expect(viewModel.workers).toHaveLength(3)
+    expect(viewModel.workers.map((worker) => worker.scopeLabel)).toEqual(['W1/S1/%12', 'W2/S2/%13', 'W3/S3/%14'])
   })
 
   it('选中 failed task 时返回完整详情字段', () => {
@@ -453,6 +548,12 @@ describe('watch state', () => {
       summary: 'failed after retry',
       dependsOn: ['T6'],
       generatedFromTaskId: 'T0',
+      execution: {
+        workerId: 'W1',
+        slotId: 1,
+        paneId: '%12',
+        tmuxSessionLabel: 'tmux-run-a:1'
+      },
       failureDetail: {
         latestFailureMessage: 'network timeout',
         summary: 'failed after retry',

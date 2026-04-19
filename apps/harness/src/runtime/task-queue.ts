@@ -1,6 +1,9 @@
 import type {
   DispatchFallbackTarget,
   DispatchAssignment,
+  DispatchRemediationTarget,
+  ExecutionTarget,
+  ModelResolution,
   RuntimeDynamicTaskStats,
   MailboxMessage,
   Plan,
@@ -29,15 +32,102 @@ import {
 } from './task-store.js'
 
 function createWorkerPool(taskCount: number, config: WorkerPoolConfig): WorkerSnapshot[] {
-  const poolSize = Math.max(1, Math.min(config.maxConcurrency, Math.max(taskCount, 1)))
-  return Array.from({ length: poolSize }, (_, index) => ({
-    workerId: `W${index + 1}`,
-    role: null,
-    taskId: null,
-    model: null,
-    status: 'idle',
-    lastHeartbeatAt: null
-  }))
+  const requestedSlotCount = config.slotCount ?? Math.min(config.maxConcurrency, Math.max(taskCount, 1))
+  const poolSize = Math.max(1, requestedSlotCount)
+  const slotMap = new Map((config.slots ?? []).map((slot) => [slot.slotId, slot]))
+  return Array.from({ length: poolSize }, (_, index) => {
+    const slot = slotMap.get(index + 1)
+    return {
+      workerId: `W${index + 1}`,
+      slotId: index + 1,
+      slotBackend: slot?.backend ?? null,
+      slotProfile: slot?.profile ?? null,
+      slotConfiguredModel: slot?.model ?? null,
+      backend: slot?.backend ?? null,
+      command: null,
+      transport: null,
+      profile: slot?.profile ?? null,
+      configuredModel: slot?.model ?? null,
+      tmux: slot?.tmux ?? null,
+      role: null,
+      taskId: null,
+      model: null,
+      status: 'idle',
+      lastHeartbeatAt: null
+    }
+  })
+}
+
+function buildSlotOverrideExecutionTarget(baseTarget: ExecutionTarget, worker: WorkerSnapshot): ExecutionTarget {
+  const nextBackend = worker.slotBackend ?? baseTarget.backend
+  const nextModel = worker.slotConfiguredModel ?? baseTarget.model
+  const backendOverridden = worker.slotBackend != null && worker.slotBackend !== baseTarget.backend
+  const modelOverridden = worker.slotConfiguredModel != null && worker.slotConfiguredModel !== baseTarget.model
+  const profileReset = backendOverridden && worker.slotProfile == null && baseTarget.profile != null
+  const nextProfile = worker.slotProfile ?? (profileReset ? undefined : baseTarget.profile)
+  const profileOverridden = worker.slotProfile != null && worker.slotProfile !== baseTarget.profile
+
+  if (!backendOverridden && !modelOverridden && !profileOverridden && !profileReset) {
+    return baseTarget
+  }
+
+  const reasons = [
+    backendOverridden ? `backend=${nextBackend}` : null,
+    modelOverridden ? `model=${nextModel}` : null,
+    profileOverridden ? `profile=${nextProfile}` : null,
+    profileReset ? 'profile=reset' : null
+  ].filter((item): item is string => Boolean(item))
+
+  return {
+    ...baseTarget,
+    backend: nextBackend,
+    model: nextModel,
+    profile: nextProfile,
+    command: backendOverridden ? undefined : baseTarget.command,
+    source: 'slot-override',
+    reason: `slot ${worker.slotId ?? worker.workerId} override: ${reasons.join(', ')}`
+  }
+}
+
+function buildCompatibilityExecutionTarget(modelResolution: ModelResolution): ExecutionTarget {
+  return {
+    backend: 'coco',
+    model: modelResolution.model,
+    source: modelResolution.source,
+    reason: modelResolution.reason,
+    transport: 'auto'
+  }
+}
+
+function normalizeFallbackTarget<T extends DispatchFallbackTarget | DispatchRemediationTarget | null>(target: T): T {
+  if (!target || target.executionTarget) {
+    return target
+  }
+
+  return {
+    ...target,
+    executionTarget: buildCompatibilityExecutionTarget(target.modelResolution)
+  } as T
+}
+
+function normalizePersistedAssignmentCompatibility(assignment: DispatchAssignment): DispatchAssignment {
+  if (assignment.executionTarget && (!assignment.fallback || assignment.fallback.executionTarget) && (!assignment.remediation || assignment.remediation.executionTarget)) {
+    return assignment
+  }
+
+  return {
+    ...assignment,
+    executionTarget: assignment.executionTarget ?? buildCompatibilityExecutionTarget(assignment.modelResolution),
+    fallback: normalizeFallbackTarget(assignment.fallback),
+    remediation: normalizeFallbackTarget(assignment.remediation)
+  }
+}
+
+function normalizePersistedTaskRecord(record: PersistedTaskRecord): PersistedTaskRecord {
+  return {
+    ...record,
+    assignment: normalizePersistedAssignmentCompatibility(record.assignment)
+  }
 }
 
 function createInitialTaskState(assignment: DispatchAssignment): RuntimeTaskState {
@@ -181,7 +271,13 @@ export class PersistentTaskQueue {
   ): PersistentTaskQueue {
     const taskStore = loadTaskStoreSnapshot(runDirectory)
     const state = loadPersistentRunState(runDirectory)
-    const taskQueue = new PersistentTaskQueue(runDirectory, state.queue.goal, taskStore.plan, state.queue, state.tasks)
+    const taskQueue = new PersistentTaskQueue(
+      runDirectory,
+      state.queue.goal,
+      taskStore.plan,
+      state.queue,
+      state.tasks.map((task) => normalizePersistedTaskRecord(task))
+    )
 
     if (options.recover) {
       taskQueue.prepareForResume(options.workerPool)
@@ -332,7 +428,13 @@ export class PersistentTaskQueue {
 
     worker.taskId = taskId
     worker.role = record.assignment.roleDefinition.name
-    worker.model = record.assignment.modelResolution.model
+    const executionTarget = buildSlotOverrideExecutionTarget(record.assignment.executionTarget, worker)
+    worker.backend = executionTarget.backend
+    worker.command = executionTarget.command ?? null
+    worker.transport = executionTarget.transport
+    worker.profile = executionTarget.profile ?? null
+    worker.configuredModel = executionTarget.model
+    worker.model = executionTarget.model
     worker.status = 'running'
     worker.lastHeartbeatAt = claimedAt
 
@@ -345,7 +447,10 @@ export class PersistentTaskQueue {
       batchId: this.getBatchId(taskId),
       attempt: record.state.attempts,
       maxAttempts: record.state.maxAttempts,
-      assignment: record.assignment
+      assignment: {
+        ...record.assignment,
+        executionTarget
+      }
     }
   }
 
@@ -397,6 +502,11 @@ export class PersistentTaskQueue {
       const worker = this.getWorker(workerId)
       worker.taskId = null
       worker.role = null
+      worker.backend = worker.slotBackend ?? null
+      worker.command = null
+      worker.transport = null
+      worker.profile = worker.slotProfile ?? null
+      worker.configuredModel = worker.slotConfiguredModel ?? null
       worker.model = null
       worker.status = 'idle'
       worker.lastHeartbeatAt = releasedAt
@@ -417,6 +527,7 @@ export class PersistentTaskQueue {
     record.assignment.roleDefinition = fallback.roleDefinition
     record.assignment.task.role = fallback.roleDefinition.name
     record.assignment.modelResolution = fallback.modelResolution
+    record.assignment.executionTarget = fallback.executionTarget
     this.queue.updatedAt = now()
     this.persist()
   }
@@ -424,14 +535,25 @@ export class PersistentTaskQueue {
   rerouteTask(taskId: string, targetRole: 'reviewer' | 'planner' | 'coder'): { fromRole: string; toRole: string } {
     const record = this.requireTask(taskId)
     const fromRole = record.assignment.roleDefinition.name
+    const remediationTarget = record.assignment.remediation?.roleDefinition.name === targetRole ? record.assignment.remediation : null
+    const rerouteTarget = (record.assignment.fallback?.roleDefinition.name === targetRole ? record.assignment.fallback : null) ?? remediationTarget
     record.assignment.roleDefinition = {
-      ...record.assignment.roleDefinition,
+      ...(rerouteTarget?.roleDefinition ?? record.assignment.roleDefinition),
       name: targetRole,
-      description: record.assignment.roleDefinition.description || targetRole
+      description: rerouteTarget?.roleDefinition.description || record.assignment.roleDefinition.description || targetRole
     }
     record.assignment.task.role = targetRole
+    if (remediationTarget) {
+      record.assignment.task.taskType = remediationTarget.taskType
+      record.assignment.task.skills = [...remediationTarget.skills]
+    }
     record.assignment.modelResolution = {
-      ...record.assignment.modelResolution,
+      ...(rerouteTarget?.modelResolution ?? record.assignment.modelResolution),
+      source: 'fallback',
+      reason: `rerouted from ${fromRole} to ${targetRole}`
+    }
+    record.assignment.executionTarget = {
+      ...(rerouteTarget?.executionTarget ?? record.assignment.executionTarget),
       source: 'fallback',
       reason: `rerouted from ${fromRole} to ${targetRole}`
     }
@@ -500,15 +622,22 @@ export class PersistentTaskQueue {
   }
 
   appendEvent(event: RuntimeEvent): void {
-    this.queue.events.push(event)
+    const createdAt = event.createdAt ?? now()
+    const persistedEvent: RuntimeEvent = {
+      ...event,
+      createdAt
+    }
+
+    this.queue.events.push(persistedEvent)
     appendRuntimeEvent({
       runDirectory: this.runDirectory,
       seq: this.queue.events.length,
-      type: toStructuredRuntimeEventType(event.type),
+      type: toStructuredRuntimeEventType(persistedEvent.type),
+      createdAt,
       payload: {
-        batchId: event.batchId,
-        taskId: event.taskId ?? null,
-        detail: event.detail
+        batchId: persistedEvent.batchId,
+        taskId: persistedEvent.taskId ?? null,
+        detail: persistedEvent.detail
       }
     })
     this.queue.updatedAt = now()
@@ -517,8 +646,13 @@ export class PersistentTaskQueue {
 
   appendTaskEvent(taskId: string, event: RuntimeEvent): void {
     const record = this.requireTask(taskId)
-    record.events.push(event)
-    this.appendEvent(event)
+    const createdAt = event.createdAt ?? now()
+    const persistedEvent: RuntimeEvent = {
+      ...event,
+      createdAt
+    }
+    record.events.push(persistedEvent)
+    this.appendEvent(persistedEvent)
   }
 
   appendMailboxMessage(message: MailboxMessage): void {
@@ -595,14 +729,33 @@ export class PersistentTaskQueue {
       }
     }
 
-    this.resetWorkerPool(workerPool?.maxConcurrency)
+    this.resetWorkerPool(workerPool)
 
     this.rebuildDerivedState()
   }
 
-  private resetWorkerPool(maxConcurrency = this.queue.maxConcurrency): void {
-    this.queue.maxConcurrency = maxConcurrency
-    this.queue.workers = createWorkerPool(this.queue.taskOrder.length, { maxConcurrency })
+  private resetWorkerPool(workerPool: WorkerPoolConfig = { maxConcurrency: this.queue.maxConcurrency, slotCount: this.queue.workers.length }): void {
+    const slots =
+      workerPool.slots ??
+      this.queue.workers.map((worker, index) => ({
+        slotId: worker.slotId ?? index + 1,
+        backend:
+          worker.slotBackend ??
+          (worker.taskId == null && worker.status === 'idle' ? worker.backend ?? undefined : undefined),
+        model:
+          worker.slotConfiguredModel ??
+          (worker.taskId == null && worker.status === 'idle' ? worker.configuredModel ?? undefined : undefined),
+        profile:
+          worker.slotProfile ??
+          (worker.taskId == null && worker.status === 'idle' ? worker.profile ?? undefined : undefined),
+        tmux: worker.tmux ?? undefined
+      }))
+    this.queue.maxConcurrency = workerPool.maxConcurrency
+    this.queue.workers = createWorkerPool(this.queue.taskOrder.length, {
+      maxConcurrency: workerPool.maxConcurrency,
+      slotCount: workerPool.slotCount ?? this.queue.workers.length,
+      slots
+    })
   }
 
   private requireTask(taskId: string): PersistedTaskRecord {

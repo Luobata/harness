@@ -6,6 +6,56 @@ export type TaskType =
   | 'testing'
   | 'coordination'
 
+export type ExecutionBackend = 'coco' | 'claude-code' | 'local-cc'
+export type ExecutionTransport = 'print' | 'pty' | 'auto'
+export type ExecutionTargetSource = ModelResolution['source'] | 'slot-override'
+
+export interface ExecutionTargetSpec {
+  backend?: ExecutionBackend
+  model?: string
+  profile?: string
+  command?: string
+  transport?: ExecutionTransport
+}
+
+export interface ExecutionTarget extends ExecutionTargetSpec {
+  backend: ExecutionBackend
+  model: string
+  source: ExecutionTargetSource
+  reason: string
+  transport: ExecutionTransport
+}
+
+export type TeamSlotOverrideKey = 'backend' | 'model' | 'profile'
+
+export interface TeamSlotOverride {
+  slotId: number
+  key: TeamSlotOverrideKey
+  value: string
+}
+
+export interface TeamSlotSpec {
+  slotId: number
+  backend?: ExecutionBackend
+  model?: string
+  profile?: string
+  tmux?: TeamSlotTmuxBinding | null
+}
+
+export interface TeamRunSpec {
+  teamSize: number
+  slots: TeamSlotSpec[]
+  overrides: TeamSlotOverride[]
+}
+
+export interface TeamSlotTmuxBinding {
+  paneId: string
+  sessionName: string
+  mode: 'split-pane' | 'dedicated-window' | 'detached-session'
+  paneIndex?: number | null
+  title?: string | null
+}
+
 export type TaskStatus = 'pending' | 'ready' | 'in_progress' | 'completed' | 'failed' | 'blocked'
 
 export type TaskPhase = 'queued' | 'ready' | 'running' | 'finalizing' | 'retrying' | 'blocked' | 'completed' | 'failed'
@@ -35,6 +85,7 @@ export interface GoalInput {
   goal: string
   teamName?: string
   compositionName?: string
+  teamRunSpec?: TeamRunSpec
   targetFile?: GoalTargetFile | null
   targetFiles?: GoalTargetFile[]
 }
@@ -88,11 +139,13 @@ export interface ModelResolution {
 export interface DispatchFallbackTarget {
   roleDefinition: RoleDefinition
   modelResolution: ModelResolution
+  executionTarget: ExecutionTarget
 }
 
 export interface DispatchRemediationTarget {
   roleDefinition: RoleDefinition
   modelResolution: ModelResolution
+  executionTarget: ExecutionTarget
   taskType: TaskType
   skills: string[]
 }
@@ -100,6 +153,7 @@ export interface DispatchRemediationTarget {
 export interface DispatchAssignment {
   task: Task
   modelResolution: ModelResolution
+  executionTarget: ExecutionTarget
   roleDefinition: RoleDefinition
   fallback: DispatchFallbackTarget | null
   remediation: DispatchRemediationTarget | null
@@ -112,6 +166,8 @@ export interface ExecutionBatch {
 
 export interface WorkerPoolConfig {
   maxConcurrency: number
+  slotCount?: number
+  slots?: TeamSlotSpec[]
 }
 
 export type WorkerStatus = 'idle' | 'running' | 'completed' | 'failed'
@@ -127,6 +183,16 @@ export interface MailboxMessage {
 
 export interface WorkerSnapshot {
   workerId: string
+  slotId?: number
+  slotBackend?: ExecutionBackend | null
+  slotProfile?: string | null
+  slotConfiguredModel?: string | null
+  backend?: ExecutionBackend | null
+  command?: string | null
+  transport?: ExecutionTransport | null
+  profile?: string | null
+  configuredModel?: string | null
+  tmux?: TeamSlotTmuxBinding | null
   role: string | null
   taskId: string | null
   model: string | null
@@ -151,6 +217,7 @@ export interface RuntimeEvent {
     | 'task-rerouted'
     | 'task-released'
     | 'batch-complete'
+  createdAt?: string
   taskId?: string
   batchId: string
   detail: string
@@ -241,6 +308,11 @@ export interface TaskExecutionResult {
   taskId: string
   role: string
   model: string
+  backend?: ExecutionBackend
+  command?: string | null
+  transport?: ExecutionTransport
+  profile?: string | null
+  slotId?: number
   summary: string
   status: Extract<TaskStatus, 'completed' | 'failed'>
   attempt: number
