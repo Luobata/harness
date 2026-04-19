@@ -353,6 +353,22 @@
       ]
     },
     {
+      "packageName": "@luobata/skill-contracts",
+      "projectFolder": "packages/skill-contracts",
+      "tags": [
+        "library",
+        "tools"
+      ]
+    },
+    {
+      "packageName": "@luobata/skill-devkit",
+      "projectFolder": "packages/skill-devkit",
+      "tags": [
+        "library",
+        "tools"
+      ]
+    },
+    {
       "packageName": "@luobata/tmux-manager",
       "projectFolder": "packages/tmux-manager",
       "tags": [

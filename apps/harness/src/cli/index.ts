@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-import { readdirSync, readFileSync } from 'node:fs'
-import { extname, resolve } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { extname, isAbsolute, relative, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { dispatchPlan } from '../dispatcher/dispatcher.js'
 import { buildPlan } from '../planner/planner.js'
@@ -19,10 +21,12 @@ import { loadSkills } from '../team/skill-loader.js'
 import { buildSkillRegistry } from '../team/skill-registry.js'
 import { loadTeamCompositionRegistry } from '../team/team-composition-loader.js'
 import { loadSlashCommandRegistry, resolveSlashCommand } from './slash-command-loader.js'
+import { dispatchSkillCommand, parseSkillCommand } from './skill-command.js'
 import { verifyAssignments, verifyRun } from '../verification/index.js'
+import type { DoctorSkillResult, ResolveSkillStatusResult } from '@luobata/skill-devkit'
 import type { GoalTargetFile } from '../domain/types.js'
 
-const { appRoot, repoRoot, stateRoot } = getHarnessRepoPaths()
+const { appRoot, repoRoot, skillsRoot, skillPacksRoot, stateRoot, skillStateRoot } = getHarnessRepoPaths()
 const roleModelConfigPath = resolveHarnessConfigPath('role-models.yaml')
 const rolesConfigPath = resolveHarnessConfigPath('roles.yaml')
 const rolePromptConfigPath = resolveHarnessConfigPath('role-prompts.yaml')
@@ -299,6 +303,96 @@ function createAdapter(params: {
   throw new Error(`adapter 非法: ${adapterKind}（可选: coco-auto, coco-cli, coco-pty, dry-run）`)
 }
 
+function resolveSkillRoot(skillName: string): string {
+  const skillRoot = resolve(skillsRoot, skillName)
+  const relativeSkillRoot = relative(skillsRoot, skillRoot)
+
+  if (relativeSkillRoot === '' || (!isAbsolute(relativeSkillRoot) && !/^\.\.(?:[\\/]|$)/.test(relativeSkillRoot))) {
+    return skillRoot
+  }
+
+  throw new Error(`skill 名称超出 skills 目录: ${skillName}`)
+}
+
+function resolveSkillInstallRoot(): string {
+  const homeDirectory = process.env.HOME ?? process.env.USERPROFILE
+
+  if (!homeDirectory) {
+    throw new Error('无法解析用户目录，请设置 HOME 或 USERPROFILE')
+  }
+
+  return resolve(homeDirectory, '.coco', 'skills')
+}
+
+function shouldRespawnSkillCommandWithPreservedSymlinks(): boolean {
+  return process.env.HARNESS_SKILL_PRESERVE_SYMLINKS !== 'true' && !process.execArgv.includes('--preserve-symlinks')
+}
+
+function respawnSkillCommand(rawArgs: string[]): void {
+  const builtCliPath = resolve(appRoot, 'dist/src/cli/index.js')
+
+  if (!existsSync(builtCliPath)) {
+    throw new Error(`skill 命令需要已构建的 CLI 入口，请先执行 pnpm --dir \"${appRoot}\" build`)
+  }
+
+  const result = spawnSync(process.execPath, ['--preserve-symlinks', builtCliPath, 'skill', ...rawArgs], {
+    cwd: repoRoot,
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      HARNESS_SKILL_PRESERVE_SYMLINKS: 'true',
+    },
+  })
+
+  if (result.error) {
+    throw result.error
+  }
+
+  process.exitCode = result.status ?? 1
+}
+
+async function loadSkillDevkit() {
+  return import(pathToFileURL(resolve(appRoot, 'node_modules/@luobata/skill-devkit/dist/index.js')).href)
+}
+
+function formatSkillStatusResult(result: ResolveSkillStatusResult): string {
+  const lines = [
+    `Skill: ${result.manifest.cocoInstallName}`,
+    `Version: ${result.manifest.version}`,
+    `Status: ${result.status}`,
+    `Health: ${result.health}`,
+    `Install Path: ${result.installPath}`,
+    `State Path: ${result.statePath}`,
+  ]
+
+  if (result.issues.length > 0) {
+    lines.push(`Issues: ${result.issues.map((issue) => issue.message).join(' | ')}`)
+  }
+
+  return `${lines.join('\n')}\n`
+}
+
+function formatDoctorSkillResult(result: DoctorSkillResult, fixRequested: boolean): string {
+  const lines = [
+    `Skill: ${result.manifest.cocoInstallName}`,
+    `Status: ${result.status}`,
+    `Health: ${result.health}`,
+    `Summary: ${result.summary}`,
+    `Install Path: ${result.installPath}`,
+    `State Path: ${result.statePath}`,
+  ]
+
+  if (result.issues.length > 0) {
+    lines.push(`Issues: ${result.issues.map((issue) => issue.message).join(' | ')}`)
+  }
+
+  if (fixRequested) {
+    lines.push('Fix Requested: true (current devkit doctor is read-only)')
+  }
+
+  return `${lines.join('\n')}\n`
+}
+
 async function main(): Promise<void> {
   const [, , rawCommand = 'plan', ...rawArgs] = process.argv
   const { flags: parsedFlags, positionals } = parseFlags(rawArgs)
@@ -307,6 +401,114 @@ async function main(): Promise<void> {
   const command = slashResolution?.command ?? rawCommand
   const normalizedInvocation = normalizeCommandInvocation(command, slashResolution?.flags ?? parsedFlags, positionals)
   const flags = normalizedInvocation.flags
+
+  if (command === 'watch') {
+    const { runWatchTui } = await import('../tui/watch.js')
+    await runWatchTui({
+      stateRoot,
+      runDirectory: flags.get('runDirectory'),
+      reportPath: flags.get('reportPath')
+    })
+    return
+  }
+
+  if (command === 'skill') {
+    parseSkillCommand(rawArgs)
+
+    if (shouldRespawnSkillCommandWithPreservedSymlinks()) {
+      respawnSkillCommand(rawArgs)
+      return
+    }
+
+    const skillDevkit = await loadSkillDevkit()
+    const installRoot = resolveSkillInstallRoot()
+
+    await dispatchSkillCommand(rawArgs, {
+      validate({ skillName }) {
+        const skillRoot = resolveSkillRoot(skillName)
+        const manifest = skillDevkit.loadSkillManifest(skillRoot)
+
+        process.stdout.write(`Validated skill: ${manifest.cocoInstallName}@${manifest.version}\nSkill Root: ${skillRoot}\n`)
+      },
+      pack({ skillName }) {
+        const skillRoot = resolveSkillRoot(skillName)
+        const result = skillDevkit.packSkill({
+          skillRoot,
+          packRoot: skillPacksRoot,
+        })
+
+        process.stdout.write(
+          `Packed skill: ${result.manifest.cocoInstallName}@${result.manifest.version}\nOutput Directory: ${result.outputDirectory}\nMetadata Path: ${result.metadataPath}\n`,
+        )
+      },
+      link({ skillName }) {
+        const skillRoot = resolveSkillRoot(skillName)
+        const result = skillDevkit.linkSkill({
+          skillRoot,
+          installRoot,
+          stateRoot: skillStateRoot,
+        })
+
+        process.stdout.write(
+          `Linked skill: ${result.manifest.cocoInstallName}@${result.manifest.version}\nInstall Path: ${result.installPath}\nState Path: ${result.statePath}\n`,
+        )
+      },
+      unlink({ skillName }) {
+        const skillRoot = resolveSkillRoot(skillName)
+        const result = skillDevkit.removeLinkedSkill({
+          skillRoot,
+          installRoot,
+          stateRoot: skillStateRoot,
+        })
+
+        process.stdout.write(
+          result.removed
+            ? `Unlinked skill: ${result.manifest.cocoInstallName}@${result.manifest.version}\nInstall Path: ${result.installPath}\nState Path: ${result.statePath}\n`
+            : `Unlink skipped: ${result.reason}\nInstall Path: ${result.installPath}\nState Path: ${result.statePath}\n`,
+        )
+      },
+      publishLocal({ skillName }) {
+        const skillRoot = resolveSkillRoot(skillName)
+        const result = skillDevkit.publishLocalSkill({
+          skillRoot,
+          packRoot: skillPacksRoot,
+          installRoot,
+          stateRoot: skillStateRoot,
+        })
+
+        process.stdout.write(
+          `Published local skill: ${result.manifest.cocoInstallName}@${result.manifest.version}\nInstall Path: ${result.installPath}\nState Path: ${result.statePath}\nPack Directory: ${result.packResult.outputDirectory}\n`,
+        )
+      },
+      status({ skillName }) {
+        const skillRoot = resolveSkillRoot(skillName)
+        const result = skillDevkit.resolveSkillStatus({
+          skillRoot,
+          installRoot,
+          stateRoot: skillStateRoot,
+        })
+
+        process.stdout.write(formatSkillStatusResult(result))
+      },
+      doctor({ skillName, fix }) {
+        const skillRoot = resolveSkillRoot(skillName)
+
+        if (fix) {
+          process.stderr.write('[harness] doctor --fix 当前仅执行只读检查，尚未调用自动修复\n')
+        }
+
+        const result = skillDevkit.doctorSkill({
+          skillRoot,
+          installRoot,
+          stateRoot: skillStateRoot,
+        })
+
+        process.stdout.write(formatDoctorSkillResult(result, fix))
+      },
+    })
+    return
+  }
+
   const goal = normalizedInvocation.positionals.join(' ').trim()
   const targetFlag = flags.get('target')
   const dirFlag = flags.get('dir')
@@ -318,16 +520,6 @@ async function main(): Promise<void> {
       : targetFiles.length > 1
         ? `基于 ${targetFiles.length} 个目标文件执行`
         : '')
-
-  if (command === 'watch') {
-    const { runWatchTui } = await import('../tui/watch.js')
-    await runWatchTui({
-      stateRoot,
-      runDirectory: flags.get('runDirectory'),
-      reportPath: flags.get('reportPath')
-    })
-    return
-  }
 
   if (!effectiveGoal && command !== 'resume') {
     throw new Error('请提供目标，或通过 -target todo.md / -target=a.md,b.md / -dir docs 指定目标输入')

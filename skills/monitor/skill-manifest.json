@@ -1,0 +1,16 @@
+{
+  "name": "monitor",
+  "displayName": "Monitor",
+  "entry": "src/index.ts",
+  "cocoInstallName": "@luobata/monitor",
+  "version": "0.1.0",
+  "files": ["skill-manifest.json", "src/**/*.ts"],
+  "dev": {
+    "link": true,
+    "publishLocal": true
+  },
+  "metadata": {
+    "description": "Local-first monitor skill seed for harness development",
+    "tags": ["monitor", "skill", "local-dev", "template"]
+  }
+}
