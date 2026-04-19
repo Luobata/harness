@@ -6,7 +6,10 @@ export type HarnessRepoPaths = {
   appRoot: string
   repoRoot: string
   configRoot: string
+  skillsRoot: string
+  skillPacksRoot: string
   stateRoot: string
+  skillStateRoot: string
 }
 
 function isHarnessAppRoot(candidatePath: string): boolean {
@@ -27,7 +30,10 @@ export function createHarnessRepoPaths(moduleUrl: string): HarnessRepoPaths {
         appRoot,
         repoRoot,
         configRoot: resolve(appRoot, 'configs'),
-        stateRoot: resolve(repoRoot, '.harness', 'state')
+        skillsRoot: resolve(repoRoot, 'skills'),
+        skillPacksRoot: resolve(repoRoot, '.harness', 'skill-packs'),
+        stateRoot: resolve(repoRoot, '.harness', 'state'),
+        skillStateRoot: resolve(repoRoot, '.harness', 'state', 'skills')
       }
     }
 
@@ -39,14 +45,18 @@ export function createHarnessRepoPaths(moduleUrl: string): HarnessRepoPaths {
   }
 }
 
-const { appRoot, repoRoot, configRoot, stateRoot } = createHarnessRepoPaths(import.meta.url)
+const { appRoot, repoRoot, configRoot, skillsRoot, skillPacksRoot, stateRoot, skillStateRoot } =
+  createHarnessRepoPaths(import.meta.url)
 
 export function getHarnessRepoPaths(): HarnessRepoPaths {
   return {
     appRoot,
     repoRoot,
     configRoot,
-    stateRoot
+    skillsRoot,
+    skillPacksRoot,
+    stateRoot,
+    skillStateRoot
   }
 }
 

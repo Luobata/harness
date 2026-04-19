@@ -12,6 +12,12 @@ importers:
 
   ../../apps/harness:
     dependencies:
+      '@luobata/skill-contracts':
+        specifier: workspace:*
+        version: link:../../packages/skill-contracts
+      '@luobata/skill-devkit':
+        specifier: workspace:*
+        version: link:../../packages/skill-devkit
       '@luobata/tmux-manager':
         specifier: workspace:*
         version: link:../../packages/tmux-manager
@@ -86,6 +92,30 @@ importers:
       vite:
         specifier: 7.1.10
         version: 7.1.10(@types/node@22.19.17)(tsx@4.21.0)(yaml@2.8.3)
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.4(@types/node@22.19.17)(jsdom@27.0.1)(tsx@4.21.0)(yaml@2.8.3)
+
+  ../../packages/skill-contracts:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.15.30
+        version: 22.19.17
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.4(@types/node@22.19.17)(jsdom@27.0.1)(tsx@4.21.0)(yaml@2.8.3)
+
+  ../../packages/skill-devkit:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.15.30
+        version: 22.19.17
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
       vitest:
         specifier: ^3.2.4
         version: 3.2.4(@types/node@22.19.17)(jsdom@27.0.1)(tsx@4.21.0)(yaml@2.8.3)

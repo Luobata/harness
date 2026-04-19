@@ -18,7 +18,10 @@ describe('repo paths', () => {
     expect(paths.appRoot).toBe(resolve(import.meta.dirname, '..'))
     expect(paths.repoRoot).toBe(resolve(import.meta.dirname, '..', '..', '..'))
     expect(paths.configRoot).toBe(resolve(paths.appRoot, 'configs'))
+    expect(paths.skillsRoot).toBe(resolve(paths.repoRoot, 'skills'))
+    expect(paths.skillPacksRoot).toBe(resolve(paths.repoRoot, '.harness', 'skill-packs'))
     expect(paths.stateRoot).toBe(resolve(paths.repoRoot, '.harness', 'state'))
+    expect(paths.skillStateRoot).toBe(resolve(paths.stateRoot, 'skills'))
   })
 
   it('stateRoot 位于 monorepo 根目录的 .harness/state', () => {
@@ -27,7 +30,10 @@ describe('repo paths', () => {
     expect(paths.appRoot).toBe(resolve(import.meta.dirname, '..'))
     expect(paths.repoRoot).toBe(resolve(paths.appRoot, '..', '..'))
     expect(paths.configRoot).toBe(resolve(paths.appRoot, 'configs'))
+    expect(paths.skillsRoot).toBe(resolve(paths.repoRoot, 'skills'))
+    expect(paths.skillPacksRoot).toBe(resolve(paths.repoRoot, '.harness', 'skill-packs'))
     expect(paths.stateRoot).toBe(resolve(paths.repoRoot, '.harness', 'state'))
+    expect(paths.skillStateRoot).toBe(resolve(paths.stateRoot, 'skills'))
   })
 
   it('当输入仅存在于 repo root 时会 fallback 到 repo root', () => {
