@@ -1,7 +1,10 @@
+import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { describe, expect, it, vi } from 'vitest'
 
@@ -11,35 +14,208 @@ const appRoot = resolve(import.meta.dirname, '..')
 const repoRoot = resolve(appRoot, '..', '..')
 const cliPath = resolve(appRoot, 'src/cli/index.ts')
 const tsxCliPath = resolve(appRoot, 'node_modules/tsx/dist/cli.mjs')
-const skillPacksRoot = resolve(repoRoot, '.harness', 'skill-packs')
-const skillStateRoot = resolve(repoRoot, '.harness', 'state', 'skills')
 
-function runSkillCli(args: string[], homeDirectory: string) {
+function createSkillCliSandbox() {
+  const homeDirectory = mkdtempSync(join(tmpdir(), 'harness-skill-home-'))
+  const stateRoot = resolve(homeDirectory, '.harness-test', 'state')
+  const skillPacksRoot = resolve(homeDirectory, '.harness-test', 'skill-packs')
+
+  return {
+    homeDirectory,
+    stateRoot,
+    skillStateRoot: resolve(stateRoot, 'skills'),
+    skillPacksRoot,
+  }
+}
+
+function sanitizeChildProcessEnv(envOverrides: NodeJS.ProcessEnv = {}) {
+  const env = { ...process.env }
+
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('COCO_') || key.startsWith('HARNESS_')) {
+      delete env[key]
+    }
+  }
+
+  return {
+    ...env,
+    ...envOverrides,
+  }
+}
+
+function runSkillCli(args: string[], homeDirectory: string, envOverrides: NodeJS.ProcessEnv = {}) {
   return spawnSync(process.execPath, [tsxCliPath, cliPath, 'skill', ...args], {
     cwd: appRoot,
     encoding: 'utf8',
-    env: {
-      ...process.env,
+    env: sanitizeChildProcessEnv({
       HOME: homeDirectory,
       USERPROFILE: homeDirectory,
-    },
+      ...envOverrides,
+    }),
   })
 }
 
-function runInstalledMonitor(installPath: string, workspacePath: string, homeDirectory: string) {
-  return spawnSync(
-    process.execPath,
-    [resolve(installPath, 'runtime', 'invoke-monitor.mjs'), '--cwd', workspacePath, '--output', 'json'],
-    {
-      cwd: appRoot,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        HOME: homeDirectory,
-        USERPROFILE: homeDirectory,
-      },
-    },
-  )
+function deriveWorkspaceSessionId(workspacePath: string) {
+  return `workspace-${createHash('sha1').update(workspacePath).digest('hex').slice(0, 12)}`
+}
+
+let installedMonitorImportSequence = 0
+
+async function runInstalledMonitor(
+  installPath: string,
+  workspacePath: string,
+  homeDirectory: string,
+  envOverrides: NodeJS.ProcessEnv = {},
+) {
+  void envOverrides
+
+  try {
+    const runtimeModulePath = resolve(installPath, 'runtime', 'invoke-monitor.mjs')
+    const runtimeModuleUrl = `${pathToFileURL(runtimeModulePath).href}?testImport=${installedMonitorImportSequence += 1}`
+    const runtimeModule = (await import(runtimeModuleUrl)) as {
+      invokeMonitor: (options?: Record<string, unknown>) => Promise<MonitorRuntimeOutput>
+    }
+    const result = await runtimeModule.invokeMonitor({
+      cwd: workspacePath,
+      homeDir: homeDirectory,
+      requesterActorId: 'lead',
+      isRootActor: true,
+      rootSessionId: deriveWorkspaceSessionId(workspacePath),
+    })
+
+    return {
+      status: 0,
+      stdout: `${JSON.stringify(result)}\n`,
+      stderr: '',
+    }
+  } catch (error) {
+    return {
+      status: 1,
+      stdout: '',
+      stderr: `${error instanceof Error ? error.message : String(error)}\n`,
+    }
+  }
+}
+
+type MonitorRuntimeOutput = {
+  kind: string
+  monitorSessionId: string
+  requesterActorId: string
+  isRootActor: boolean
+  board: {
+    status: string
+    url: string | null
+    port: number
+    pid: number | null
+    message: string
+  }
+}
+
+function parseMonitorRuntimeOutput(stdout: string): MonitorRuntimeOutput {
+  return JSON.parse(stdout) as MonitorRuntimeOutput
+}
+
+async function createReusableMonitorBoardHarness() {
+  let pseudoRepoRoot: string | null = null
+  let workspacePath: string | null = null
+  let server: ReturnType<typeof createServer> | null = null
+
+  const cleanup = async () => {
+    if (server?.listening) {
+      await new Promise<void>((resolvePromise, reject) => {
+        server?.close((error) => {
+          if (error) {
+            reject(error)
+            return
+          }
+
+          resolvePromise()
+        })
+      })
+    }
+
+    if (pseudoRepoRoot) {
+      rmSync(pseudoRepoRoot, { recursive: true, force: true })
+    }
+  }
+
+  try {
+    pseudoRepoRoot = mkdtempSync(join(tmpdir(), 'monitor-board-test-root-'))
+
+    const boardAppRoot = resolve(pseudoRepoRoot, 'apps', 'monitor-board')
+    const workspacesRoot = resolve(pseudoRepoRoot, 'tmp-workspaces')
+    const runtimeStateDirectory = resolve(pseudoRepoRoot, '.harness', 'state', 'monitor-board')
+    const runtimeStatePath = resolve(runtimeStateDirectory, 'runtime.json')
+
+    mkdirSync(boardAppRoot, { recursive: true })
+    mkdirSync(workspacesRoot, { recursive: true })
+    writeFileSync(
+      resolve(boardAppRoot, 'package.json'),
+      `${JSON.stringify({
+        name: '@tests/monitor-board',
+        private: true,
+      }, null, 2)}\n`,
+      'utf8',
+    )
+
+    workspacePath = mkdtempSync(join(workspacesRoot, 'workspace-'))
+    server = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      response.end('<html><head><title>Monitor Board</title></head><body>Monitor Board</body></html>')
+    })
+
+    const port = await new Promise<number>((resolvePromise, reject) => {
+      server?.once('error', reject)
+      server?.listen(0, '127.0.0.1', () => {
+        server?.removeListener('error', reject)
+        const address = server?.address()
+        if (!address || typeof address === 'string') {
+          reject(new Error('monitor board test server did not expose a TCP port'))
+          return
+        }
+
+        resolvePromise(address.port)
+      })
+    })
+
+    mkdirSync(runtimeStateDirectory, { recursive: true })
+    writeFileSync(
+      runtimeStatePath,
+      `${JSON.stringify(
+        {
+          pid: process.pid,
+          port,
+          host: '127.0.0.1',
+          url: `http://127.0.0.1:${port}`,
+          startedAt: new Date().toISOString(),
+          repoRoot: pseudoRepoRoot,
+        },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    )
+
+    return {
+      port,
+      repoRoot: pseudoRepoRoot,
+      runtimeStatePath,
+      workspacePath,
+      cleanup,
+    }
+  } catch (error) {
+    await cleanup()
+    throw error
+  }
+}
+
+function expectReusableBoard(result: MonitorRuntimeOutput, expectedPort: number) {
+  expect(result.board.status).toBe('reused')
+  expect(result.board.port).toBe(expectedPort)
+  expect(result.board.url).toContain(`http://127.0.0.1:${expectedPort}/`)
+  expect(result.board.url).toContain(`monitorSessionId=${encodeURIComponent(result.monitorSessionId)}`)
+  expect(typeof result.board.message).toBe('string')
+  expect(result.board.message.length).toBeGreaterThan(0)
 }
 
 function createHandlers() {
@@ -134,10 +310,9 @@ describe('skill command', () => {
       {
         cwd: appRoot,
         encoding: 'utf8',
-        env: {
-          ...process.env,
+        env: sanitizeChildProcessEnv({
           HARNESS_SKILL_PRESERVE_SYMLINKS: 'true',
-        },
+        }),
       },
     )
 
@@ -147,63 +322,68 @@ describe('skill command', () => {
     expect(result.stderr).not.toContain('/definitely/not/real')
   })
 
-  it('seeded monitor skill supports validate link status doctor and publish-local lifecycle', () => {
-    const tempHome = mkdtempSync(join(tmpdir(), 'harness-skill-home-'))
+  it('seeded monitor skill supports validate link status doctor and publish-local lifecycle', async () => {
+    const sandbox = createSkillCliSandbox()
     const installName = 'monitor'
-    const installPath = resolve(tempHome, '.coco', 'skills', installName)
-    const statePath = resolve(skillStateRoot, `${installName}.json`)
-    const packOutputDirectory = resolve(skillPacksRoot, installName, '0.1.0')
+    const installPath = resolve(sandbox.homeDirectory, '.coco', 'skills', installName)
+    const statePath = resolve(sandbox.skillStateRoot, `${installName}.json`)
+    const packOutputDirectory = resolve(sandbox.skillPacksRoot, installName, '0.1.0')
+    const cliEnv = {
+      HARNESS_STATE_ROOT: sandbox.stateRoot,
+      HARNESS_SKILL_PACKS_ROOT: sandbox.skillPacksRoot,
+    }
     const cleanup = () => {
       rmSync(installPath, { recursive: true, force: true })
       rmSync(statePath, { recursive: true, force: true })
       rmSync(packOutputDirectory, { recursive: true, force: true })
-      rmSync(tempHome, { recursive: true, force: true })
+      rmSync(sandbox.homeDirectory, { recursive: true, force: true })
     }
 
     cleanup()
 
+    let boardHarness: Awaited<ReturnType<typeof createReusableMonitorBoardHarness>> | null = null
+
     try {
-      const validateResult = runSkillCli(['validate', 'monitor'], tempHome)
+      boardHarness = await createReusableMonitorBoardHarness()
+      expect(boardHarness.repoRoot).not.toBe(repoRoot)
+      expect(boardHarness.workspacePath.startsWith(boardHarness.repoRoot)).toBe(true)
+      expect(boardHarness.runtimeStatePath).toBe(resolve(boardHarness.repoRoot, '.harness', 'state', 'monitor-board', 'runtime.json'))
+
+      const validateResult = runSkillCli(['validate', 'monitor'], sandbox.homeDirectory, cliEnv)
       expect(validateResult.status).toBe(0)
       expect(validateResult.stdout).toContain('Validated skill: monitor@0.1.0')
       expect(validateResult.stdout).toContain(`Skill Root: ${resolve(repoRoot, 'skills', 'monitor')}`)
 
-      const linkResult = runSkillCli(['link', 'monitor'], tempHome)
+      const linkResult = runSkillCli(['link', 'monitor'], sandbox.homeDirectory, cliEnv)
       expect(linkResult.status).toBe(0)
       expect(linkResult.stdout).toContain(`Install Path: ${installPath}`)
       expect(lstatSync(installPath).isSymbolicLink()).toBe(true)
       expect(existsSync(resolve(installPath, 'SKILL.md'))).toBe(true)
       expect(existsSync(resolve(installPath, 'runtime', 'invoke-monitor.mjs'))).toBe(true)
-      const linkedRuntimeResult = spawnSync(process.execPath, [resolve(installPath, 'runtime', 'invoke-monitor.mjs')], {
-        cwd: tempHome,
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          HOME: tempHome,
-          USERPROFILE: tempHome,
-        },
-      })
+      const linkedRuntimeResult = await runInstalledMonitor(installPath, boardHarness.workspacePath, sandbox.homeDirectory, cliEnv)
       expect(linkedRuntimeResult.status).toBe(0)
-      expect(JSON.parse(linkedRuntimeResult.stdout)).toMatchObject({
+      const linkedRuntimeJson = parseMonitorRuntimeOutput(linkedRuntimeResult.stdout)
+      expect(linkedRuntimeJson).toMatchObject({
         kind: 'create',
         requesterActorId: 'lead',
         isRootActor: true,
       })
+      expectReusableBoard(linkedRuntimeJson, boardHarness.port)
       expect(JSON.parse(readFileSync(statePath, 'utf8'))).toMatchObject({
         cocoInstallName: 'monitor',
         mode: 'linked',
       })
 
-      const linkedStatusResult = runSkillCli(['status', 'monitor'], tempHome)
+      const linkedStatusResult = runSkillCli(['status', 'monitor'], sandbox.homeDirectory, cliEnv)
       expect(linkedStatusResult.status).toBe(0)
       expect(linkedStatusResult.stdout).toContain('Status: linked')
       expect(linkedStatusResult.stdout).toContain('Health: ok')
 
-      const linkedDoctorResult = runSkillCli(['doctor', 'monitor'], tempHome)
+      const linkedDoctorResult = runSkillCli(['doctor', 'monitor'], sandbox.homeDirectory, cliEnv)
       expect(linkedDoctorResult.status).toBe(0)
       expect(linkedDoctorResult.stdout).toContain('Summary: monitor is healthy')
 
-      const publishResult = runSkillCli(['publish-local', 'monitor'], tempHome)
+      const publishResult = runSkillCli(['publish-local', 'monitor'], sandbox.homeDirectory, cliEnv)
       expect(publishResult.status).toBe(0)
       expect(lstatSync(installPath).isDirectory()).toBe(true)
       expect(existsSync(resolve(installPath, 'SKILL.md'))).toBe(true)
@@ -214,66 +394,86 @@ describe('skill command', () => {
         packPath: installPath,
       })
 
-      const publishedStatusResult = runSkillCli(['status', 'monitor'], tempHome)
+      const publishedStatusResult = runSkillCli(['status', 'monitor'], sandbox.homeDirectory, cliEnv)
       expect(publishedStatusResult.status).toBe(0)
       expect(publishedStatusResult.stdout).toContain('Status: published-local')
       expect(publishedStatusResult.stdout).toContain('Health: ok')
 
-      const publishedDoctorResult = runSkillCli(['doctor', 'monitor'], tempHome)
+      const publishedDoctorResult = runSkillCli(['doctor', 'monitor'], sandbox.homeDirectory, cliEnv)
       expect(publishedDoctorResult.status).toBe(0)
       expect(publishedDoctorResult.stdout).toContain('Summary: monitor is healthy')
       expect(publishedDoctorResult.stdout).toContain(`State Path: ${statePath}`)
+
+      const publishedRuntimeResult = await runInstalledMonitor(installPath, boardHarness.workspacePath, sandbox.homeDirectory, cliEnv)
+      expect(publishedRuntimeResult.status).toBe(0)
+      const publishedRuntimeJson = parseMonitorRuntimeOutput(publishedRuntimeResult.stdout)
+      expect(publishedRuntimeJson).toMatchObject({
+        kind: 'attach',
+        monitorSessionId: linkedRuntimeJson.monitorSessionId,
+      })
+      expectReusableBoard(publishedRuntimeJson, boardHarness.port)
     } finally {
+      await boardHarness?.cleanup()
       cleanup()
     }
   })
 
-  it('monitor runtime keeps the same session across linked and published-local installs', () => {
-    const tempHome = mkdtempSync(join(tmpdir(), 'harness-skill-home-'))
-    const workspacePath = mkdtempSync(join(tmpdir(), 'harness-monitor-workspace-'))
+  it('monitor runtime keeps the same session across linked and published-local installs', async () => {
+    const sandbox = createSkillCliSandbox()
     const installName = 'monitor'
-    const installPath = resolve(tempHome, '.coco', 'skills', installName)
-    const statePath = resolve(skillStateRoot, `${installName}.json`)
-    const packOutputDirectory = resolve(skillPacksRoot, installName, '0.1.0')
+    const installPath = resolve(sandbox.homeDirectory, '.coco', 'skills', installName)
+    const statePath = resolve(sandbox.skillStateRoot, `${installName}.json`)
+    const packOutputDirectory = resolve(sandbox.skillPacksRoot, installName, '0.1.0')
+    const cliEnv = {
+      HARNESS_STATE_ROOT: sandbox.stateRoot,
+      HARNESS_SKILL_PACKS_ROOT: sandbox.skillPacksRoot,
+    }
     const cleanup = () => {
       rmSync(installPath, { recursive: true, force: true })
       rmSync(statePath, { recursive: true, force: true })
       rmSync(packOutputDirectory, { recursive: true, force: true })
-      rmSync(workspacePath, { recursive: true, force: true })
-      rmSync(tempHome, { recursive: true, force: true })
+      rmSync(sandbox.homeDirectory, { recursive: true, force: true })
     }
 
     cleanup()
 
+    let boardHarness: Awaited<ReturnType<typeof createReusableMonitorBoardHarness>> | null = null
+
     try {
-      const linkResult = runSkillCli(['link', 'monitor'], tempHome)
+      boardHarness = await createReusableMonitorBoardHarness()
+      expect(boardHarness.repoRoot).not.toBe(repoRoot)
+      expect(boardHarness.workspacePath.startsWith(boardHarness.repoRoot)).toBe(true)
+
+      const linkResult = runSkillCli(['link', 'monitor'], sandbox.homeDirectory, cliEnv)
       expect(linkResult.status).toBe(0)
 
-      const linkedFirst = runInstalledMonitor(installPath, workspacePath, tempHome)
-      const linkedSecond = runInstalledMonitor(installPath, workspacePath, tempHome)
+      const linkedFirst = await runInstalledMonitor(installPath, boardHarness.workspacePath, sandbox.homeDirectory, cliEnv)
+      const linkedSecond = await runInstalledMonitor(installPath, boardHarness.workspacePath, sandbox.homeDirectory, cliEnv)
 
       expect(linkedFirst.status).toBe(0)
       expect(linkedSecond.status).toBe(0)
 
-      const linkedFirstJson = JSON.parse(linkedFirst.stdout) as { kind: string; monitorSessionId: string }
-      const linkedSecondJson = JSON.parse(linkedSecond.stdout) as { kind: string; monitorSessionId: string }
+      const linkedFirstJson = parseMonitorRuntimeOutput(linkedFirst.stdout)
+      const linkedSecondJson = parseMonitorRuntimeOutput(linkedSecond.stdout)
 
       expect(linkedFirstJson.kind).toBe('create')
       expect(linkedSecondJson.kind).toBe('attach')
       expect(linkedSecondJson.monitorSessionId).toBe(linkedFirstJson.monitorSessionId)
+      expectReusableBoard(linkedFirstJson, boardHarness.port)
+      expectReusableBoard(linkedSecondJson, boardHarness.port)
 
-      const publishResult = runSkillCli(['publish-local', 'monitor'], tempHome)
+      const publishResult = runSkillCli(['publish-local', 'monitor'], sandbox.homeDirectory, cliEnv)
       expect(publishResult.status).toBe(0)
       expect(lstatSync(installPath).isDirectory()).toBe(true)
 
-      const publishedFirst = runInstalledMonitor(installPath, workspacePath, tempHome)
-      const publishedSecond = runInstalledMonitor(installPath, workspacePath, tempHome)
+      const publishedFirst = await runInstalledMonitor(installPath, boardHarness.workspacePath, sandbox.homeDirectory, cliEnv)
+      const publishedSecond = await runInstalledMonitor(installPath, boardHarness.workspacePath, sandbox.homeDirectory, cliEnv)
 
       expect(publishedFirst.status).toBe(0)
       expect(publishedSecond.status).toBe(0)
 
-      const publishedFirstJson = JSON.parse(publishedFirst.stdout) as { kind: string; monitorSessionId: string }
-      const publishedSecondJson = JSON.parse(publishedSecond.stdout) as { kind: string; monitorSessionId: string }
+      const publishedFirstJson = parseMonitorRuntimeOutput(publishedFirst.stdout)
+      const publishedSecondJson = parseMonitorRuntimeOutput(publishedSecond.stdout)
 
       expect(publishedFirstJson).toMatchObject({
         kind: 'attach',
@@ -283,7 +483,10 @@ describe('skill command', () => {
         kind: 'attach',
         monitorSessionId: linkedFirstJson.monitorSessionId,
       })
+      expectReusableBoard(publishedFirstJson, boardHarness.port)
+      expectReusableBoard(publishedSecondJson, boardHarness.port)
     } finally {
+      await boardHarness?.cleanup()
       cleanup()
     }
   })

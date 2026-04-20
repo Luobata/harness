@@ -16,6 +16,19 @@ function isHarnessAppRoot(candidatePath: string): boolean {
   return existsSync(resolve(candidatePath, 'package.json')) && existsSync(resolve(candidatePath, 'configs'))
 }
 
+function resolveRootOverride(envVarName: 'HARNESS_SKILL_PACKS_ROOT' | 'HARNESS_STATE_ROOT', fallbackPath: string): string {
+  const rawOverride = process.env[envVarName]?.trim()
+  if (!rawOverride) {
+    return fallbackPath
+  }
+
+  if (!isAbsolute(rawOverride)) {
+    throw new Error(`${envVarName} must be an absolute path: ${rawOverride}`)
+  }
+
+  return rawOverride
+}
+
 export function createHarnessRepoPaths(moduleUrl: string): HarnessRepoPaths {
   const moduleFilePath = fileURLToPath(moduleUrl)
   let currentDirectory = dirname(moduleFilePath)
@@ -25,15 +38,16 @@ export function createHarnessRepoPaths(moduleUrl: string): HarnessRepoPaths {
     if (isHarnessAppRoot(currentDirectory)) {
       const appRoot = currentDirectory
       const repoRoot = resolve(appRoot, '..', '..')
+      const stateRoot = resolveRootOverride('HARNESS_STATE_ROOT', resolve(repoRoot, '.harness', 'state'))
 
       return {
         appRoot,
         repoRoot,
         configRoot: resolve(appRoot, 'configs'),
         skillsRoot: resolve(repoRoot, 'skills'),
-        skillPacksRoot: resolve(repoRoot, '.harness', 'skill-packs'),
-        stateRoot: resolve(repoRoot, '.harness', 'state'),
-        skillStateRoot: resolve(repoRoot, '.harness', 'state', 'skills')
+        skillPacksRoot: resolveRootOverride('HARNESS_SKILL_PACKS_ROOT', resolve(repoRoot, '.harness', 'skill-packs')),
+        stateRoot,
+        skillStateRoot: resolve(stateRoot, 'skills')
       }
     }
 

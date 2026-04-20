@@ -25,10 +25,26 @@ node "$HOME/.coco/skills/monitor/runtime/invoke-monitor.mjs" --cwd "$PWD" --outp
 - Repeated `/monitor` calls => `kind=attach`
 - Child callers never create nested monitors
 
+## Runtime Output Contract
+
+The runtime returns JSON with:
+
+- `kind`: `create` or `attach`
+- `monitorSessionId`: current monitor session identifier
+- `message`: human-readable summary of the create/attach result
+- `board.url`: a monitor-board URL for the current `monitorSessionId` when the board is available
+
+The `board` object follows this contract:
+
+- `board.status=started`: the runtime started monitor-board for this invocation
+- `board.status=reused`: the runtime reused an existing monitor-board and returned a session-specific URL
+- `board.status=failed`: monitor-board could not be started or reused; `board.url` is `null` and `board.message` explains why
+
 ## Operating Rules
 
 1. Run the command exactly once per invocation.
-2. Parse the JSON response and report `kind`, `monitorSessionId`, and `message`.
+2. Parse the JSON response and report `kind`, `monitorSessionId`, `message`, and `board` status/URL details.
 3. If the runtime reuses an existing session, explain that the result is an attach to the reused session.
-4. Do not auto-open monitor-board or any viewer UI.
-5. Do not create nested monitor sessions.
+4. If `board.url` is present, tell the user to open that URL manually.
+5. Do not auto-open monitor-board, a browser, or any viewer UI.
+6. Do not create nested monitor sessions.

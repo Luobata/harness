@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 
+import { ensureMonitorBoardRunning as defaultEnsureBoardRunning } from './board-launcher.mjs'
 import { resolveMonitorContext } from './context.mjs'
 import { openMonitorSession } from './monitor-session.mjs'
 import { readMonitorSessionState, writeMonitorSessionState } from './session-store.mjs'
@@ -30,6 +31,7 @@ const resolveOwnerActorId = ({ context, existingSession, result }) => {
 
 export async function invokeMonitor(options = {}) {
   const context = resolveMonitorContext(options)
+  const ensureBoardRunning = options.ensureBoardRunning ?? defaultEnsureBoardRunning
   const existingSession = await readMonitorSessionState(context.stateFilePath)
   const result = openMonitorSession({
     rootSessionId: context.rootSessionId,
@@ -50,6 +52,25 @@ export async function invokeMonitor(options = {}) {
 
   await writeMonitorSessionState(context.stateFilePath, persistedSession)
 
+  let board
+  try {
+    board = await ensureBoardRunning({
+      repoRoot: context.boardRepoRoot,
+      runtimeStatePath: context.boardRuntimeStatePath,
+      monitorSessionId: result.monitorSessionId,
+      host: context.boardHost,
+      preferredPort: context.boardPort,
+    })
+  } catch (error) {
+    board = {
+      status: 'failed',
+      url: null,
+      port: context.boardPort,
+      pid: null,
+      message: error instanceof Error ? error.message : String(error),
+    }
+  }
+
   return {
     kind: result.kind,
     monitorSessionId: result.monitorSessionId,
@@ -57,6 +78,7 @@ export async function invokeMonitor(options = {}) {
     requesterActorId: result.requesterActorId,
     isRootActor: result.isRootActor,
     message: appendLegacyInstallWarning(result.message, context),
+    board,
   }
 }
 

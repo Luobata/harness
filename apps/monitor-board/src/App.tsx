@@ -7,7 +7,6 @@ import { RunTree, type RunTreeNode } from './components/RunTree';
 import { TimelinePanel, type TimelineEntry } from './components/TimelinePanel';
 import { TopBar } from './components/TopBar';
 import type { BoardMode } from './store/useBoardStore';
-import { connectBoardSocket, type BoardSocketConnection, type BoardSocketConnector } from './lib/socket';
 import './styles/pixel-theme.css';
 
 type SessionActor = SessionSnapshot['state']['actors'][number];
@@ -35,7 +34,49 @@ interface AppProps {
   connectSocket?: BoardSocketConnector;
 }
 
+type BoardSocketConnection = Pick<WebSocket, 'close'>;
+type BoardSocketConnector = (url: string, onMessage: (payload: unknown) => void) => BoardSocketConnection;
+
 const DEFAULT_SOCKET_URL = 'ws://127.0.0.1:8787';
+
+const connectBoardSocket: BoardSocketConnector = (url, onMessage) => {
+  const socket = new WebSocket(url);
+
+  socket.addEventListener('message', (event) => {
+    if (typeof event.data !== 'string') {
+      return;
+    }
+
+    try {
+      onMessage(JSON.parse(event.data));
+    } catch {
+      // Ignore malformed websocket payloads and wait for the next snapshot.
+    }
+  });
+
+  return socket;
+};
+
+const buildFallbackSnapshot = (monitorSessionId: string): SessionSnapshot => ({
+  ...demoSnapshot,
+  monitorSessionId,
+  state: {
+    ...demoSnapshot.state,
+    timeline: demoSnapshot.state.timeline.map((event) => ({
+      ...event,
+      monitorSessionId,
+    })),
+  },
+});
+
+const resolveDemoSnapshot = () => {
+  if (typeof window === 'undefined') {
+    return demoSnapshot;
+  }
+
+  const monitorSessionId = new URLSearchParams(window.location.search).get('monitorSessionId')?.trim();
+  return monitorSessionId ? buildFallbackSnapshot(monitorSessionId) : demoSnapshot;
+};
 
 const demoSnapshot: SessionSnapshot = {
   monitorSessionId: 'Task 8 Board',
@@ -426,11 +467,12 @@ const isSessionSnapshot = (payload: unknown): payload is SessionSnapshot => {
 };
 
 export const App = ({
-  initialSnapshot = demoSnapshot,
+  initialSnapshot,
   socketUrl = DEFAULT_SOCKET_URL,
   connectSocket = connectBoardSocket,
 }: AppProps) => {
-  const [snapshot, setSnapshot] = useState<SessionSnapshot>(initialSnapshot);
+  const resolvedInitialSnapshot = useMemo(() => initialSnapshot ?? resolveDemoSnapshot(), [initialSnapshot]);
+  const [snapshot, setSnapshot] = useState<SessionSnapshot>(resolvedInitialSnapshot);
 
   const mode = useBoardStore((state) => state.mode);
   const selectedActorId = useBoardStore((state) => state.selectedActorId);
@@ -438,8 +480,8 @@ export const App = ({
   const setSelectedActorId = useBoardStore((state) => state.setSelectedActorId);
 
   useEffect(() => {
-    setSnapshot(initialSnapshot);
-  }, [initialSnapshot]);
+    setSnapshot(resolvedInitialSnapshot);
+  }, [resolvedInitialSnapshot]);
 
   useEffect(() => {
     let socket: BoardSocketConnection | null = null;

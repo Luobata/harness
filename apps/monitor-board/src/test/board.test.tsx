@@ -197,6 +197,7 @@ describe('App', () => {
   });
 
   beforeEach(() => {
+    window.history.replaceState({}, '', '/');
     useBoardStore.setState({
       mode: 'summary',
       selectedActorId: null,
@@ -241,6 +242,15 @@ describe('App', () => {
 
     expect(screen.getByText('Task 8 Board')).toBeInTheDocument();
     expect(screen.getAllByText('Coordinating panel focus state').length).toBeGreaterThan(0);
+  });
+
+  it('seeds the fallback snapshot from monitorSessionId in the URL querystring', () => {
+    window.history.replaceState({}, '', '/?monitorSessionId=monitor:url-seed');
+
+    render(<App connectSocket={() => { throw new Error('offline'); }} />);
+
+    expect(screen.getByText('monitor:url-seed')).toBeInTheDocument();
+    expect(screen.queryByText('Task 8 Board')).not.toBeInTheDocument();
   });
 
   it('applies live SessionSnapshot updates received from the gateway socket', async () => {

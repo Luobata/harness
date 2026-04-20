@@ -3,6 +3,8 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const DEFAULT_REQUESTER_ACTOR_ID = 'lead'
+const DEFAULT_BOARD_HOST = '127.0.0.1'
+const DEFAULT_BOARD_PORT = 5173
 
 const isDefaultRootActorId = (actorId) =>
   actorId === DEFAULT_REQUESTER_ACTOR_ID || actorId.startsWith(`${DEFAULT_REQUESTER_ACTOR_ID}-`)
@@ -22,6 +24,33 @@ const resolveBooleanOption = (options, key, fallback) => {
   return fallback
 }
 
+const resolveBoardPort = (value) => {
+  const parsed = Number.parseInt(String(value ?? DEFAULT_BOARD_PORT), 10)
+
+  if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65_535) {
+    return parsed
+  }
+
+  return DEFAULT_BOARD_PORT
+}
+
+const findBoardRepoRoot = (cwd) => {
+  let current = cwd
+
+  while (true) {
+    if (existsSync(resolve(current, 'apps', 'monitor-board', 'package.json'))) {
+      return current
+    }
+
+    const parent = resolve(current, '..')
+    if (parent === current) {
+      return null
+    }
+
+    current = parent
+  }
+}
+
 export function getSessionStateFileName(rootSessionId) {
   return `${encodeURIComponent(rootSessionId)}.json`
 }
@@ -30,6 +59,12 @@ export function resolveMonitorContext(options = {}) {
   const cwd = resolve(options.cwd ?? process.cwd())
   const homeDir = resolve(options.homeDir ?? process.env.HOME ?? process.env.USERPROFILE ?? cwd)
   const stateRoot = resolve(cwd, '.harness', 'state', 'monitor-sessions')
+  const boardRepoRoot = findBoardRepoRoot(cwd)
+  const boardHost = options.boardHost ?? DEFAULT_BOARD_HOST
+  const boardPort = resolveBoardPort(options.boardPort)
+  const boardRuntimeStatePath = boardRepoRoot
+    ? resolve(boardRepoRoot, '.harness', 'state', 'monitor-board', 'runtime.json')
+    : null
 
   mkdirSync(stateRoot, { recursive: true })
 
@@ -47,6 +82,10 @@ export function resolveMonitorContext(options = {}) {
     rootSessionId,
     requesterActorId,
     isRootActor,
+    boardRepoRoot,
+    boardHost,
+    boardPort,
+    boardRuntimeStatePath,
     legacyInstallPath,
     hasLegacyInstall: existsSync(legacyInstallPath),
   }
