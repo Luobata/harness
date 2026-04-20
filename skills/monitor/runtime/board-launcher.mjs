@@ -95,14 +95,21 @@ async function defaultWaitForPort({ host, port, timeoutMs = DEFAULT_TIMEOUT_MS, 
 }
 
 function defaultSpawnProcess({ repoRoot, host, port }) {
-  const boardAppRoot = resolve(repoRoot, 'apps', 'monitor-board')
-  const command = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
-  const args = ['--dir', boardAppRoot, 'dev', '--', '--host', host, '--port', String(port)]
+  const { command, args } = createMonitorBoardLaunchSpec({ repoRoot, host, port })
   return spawn(command, args, {
     detached: true,
     stdio: 'ignore',
     env: process.env,
   })
+}
+
+export function createMonitorBoardLaunchSpec({ repoRoot, host, port }) {
+  const boardAppRoot = resolve(repoRoot, 'apps', 'monitor-board')
+
+  return {
+    command: process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm',
+    args: ['--dir', boardAppRoot, 'exec', 'vite', '--host', host, '--port', String(port)],
+  }
 }
 
 async function defaultCleanupProcess({ child, pid }) {

@@ -35,6 +35,16 @@ class FakeChildProcess extends EventEmitter {
 }
 
 describe('monitor board launcher', () => {
+  it('builds a launch command that passes host and port directly to vite', async () => {
+    const repoRoot = createTempRoot()
+    const mod = await loadBoardLauncher()
+
+    expect(mod.createMonitorBoardLaunchSpec({ repoRoot, host: '127.0.0.1', port: 5173 })).toEqual({
+      command: 'pnpm',
+      args: ['--dir', resolve(repoRoot, 'apps', 'monitor-board'), 'exec', 'vite', '--host', '127.0.0.1', '--port', '5173'],
+    })
+  })
+
   it('starts monitor-board when no state exists and the port is offline', async () => {
     const repoRoot = createTempRoot()
     const runtimeStatePath = resolve(repoRoot, '.harness', 'state', 'monitor-board', 'runtime.json')
